@@ -6,3 +6,5 @@
 /node_modules
 **/node_modules
 *.pyc
+crates/spherekit-dotnet/dotnet/**/bin/
+crates/spherekit-dotnet/dotnet/**/obj/

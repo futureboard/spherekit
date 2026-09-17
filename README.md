@@ -192,6 +192,8 @@ Both entry paths converge at `spherekit-ui`, and nothing below it can tell which
 | `spherekit-jsengine` | Embedded V8: isolate, host bindings, microtask and platform pumping |
 | `spherekit-bridge`   | JSON Lines protocol between a React front end and the native host   |
 | `spherekit-react`    | React renderer, and the Rust host that validates and lowers commits |
+| `spherekit-python`   | Python tree wrapper over the native host                         |
+| `spherekit-dotnet`   | C ABI and C#/.NET tree wrapper over the native host               |
 | `spherekit-cli`      | `spherekit` command: scaffolds and builds React + Rust apps         |
 | `spherekit`          | Facade that re-exports the whole engine                             |
 
@@ -211,6 +213,10 @@ Requires Rust 1.87 or newer (edition 2024).
 cargo build --workspace
 cargo test --workspace
 cargo clippy --workspace --all-targets --all-features
+
+# C#/.NET wrapper (from a checkout)
+cargo build -p spherekit-dotnet --release
+dotnet build crates/spherekit-dotnet/dotnet/SphereKit/SphereKit.csproj --configuration Release
 ```
 
 > **Windows note.** Build from PowerShell or `cmd`, not from Git Bash. Git Bash puts a GNU

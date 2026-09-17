@@ -24,7 +24,7 @@ use spherekit_react::{EventQueue, ReactHost};
 /// rather than an error, so a Python script written against a newer engine
 /// degrades to boxes instead of failing — but these are the ones with
 /// behaviour attached.
-pub const NODE_TYPES: [&str; 14] = [
+pub const NODE_TYPES: [&str; 15] = [
     "view",
     "text",
     "button",
@@ -39,6 +39,7 @@ pub const NODE_TYPES: [&str; 14] = [
     "scroll-view",
     "text-field",
     "avatar",
+    "menu-item",
 ];
 
 /// Set by `quit()` from inside a Python callback, read by the loop.

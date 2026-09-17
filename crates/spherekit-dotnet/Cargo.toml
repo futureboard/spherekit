@@ -1,0 +1,25 @@
+[package]
+name = "spherekit-dotnet"
+description = "SphereKit native C ABI used by the .NET wrapper."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords = ["dotnet", "csharp", "ffi", "gui", "ui"]
+categories = ["gui", "api-bindings"]
+
+[lib]
+name = "spherekit_dotnet"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+spherekit.workspace = true
+spherekit-react.workspace = true
+spherekit-ui.workspace = true
+spherekit-core.workspace = true
+spherekit-platform.workspace = true
+spherekit-css.workspace = true
+serde_json.workspace = true
+pollster.workspace = true

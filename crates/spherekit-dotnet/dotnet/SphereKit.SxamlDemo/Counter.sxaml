@@ -1,0 +1,12 @@
+<View xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Class="page" x:Name="counter">
+  <Text Class="title">SphereKit SXAML</Text>
+  <Text Class="subtle">This layout is loaded from Counter.sxaml.</Text>
+  <Panel Class="card" Title="Counter">
+    <Text Class="count">{{COUNT}}</Text>
+    <View Class="row">
+      <Button Content="Add one" OnPress="Add" />
+      <Button Content="Reset" Disabled="{{RESET_DISABLED}}" OnPress="Reset" />
+    </View>
+  </Panel>
+  <Button Content="Quit" OnPress="Quit" />
+</View>
