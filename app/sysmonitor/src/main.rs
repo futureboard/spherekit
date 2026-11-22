@@ -1468,7 +1468,6 @@ impl Element for CaptionButton {
             &layout,
             origin,
             colour,
-            spherekit::render::TextRasterMode::Auto,
             (Px::ZERO, Color::TRANSPARENT),
             spherekit::render::coverage_contrast_for(colour, background),
         );

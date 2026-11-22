@@ -7,18 +7,23 @@ than against intent.
 
 ## Where v0.1 stands
 
-**81,043 lines** of Rust and WGSL, plus 2,538 of TypeScript and 619 of C++ (the V8 shim).
+**81,043 lines** of Rust and WGSL (counted before WGSL was replaced by HLSL), plus 2,538 of TypeScript.
 **1,571 Rust tests** — 1,556 unit and integration, 15 doc — and **53 TypeScript tests**. Zero
 warnings, clippy clean, `cargo fmt` clean.
 
 Counted from `cargo test --workspace` and `bun test` on Windows. On Linux and macOS the total is 26
-lower: `spherekit-jsengine`'s 19 tests and `spherekit-bridge`'s 7 V8 tests need the Windows prebuilt.
+lower: `spherekit-jsengine`'s 19 tests and `spherekit-bridge`'s 7 V8 tests download rusty_v8's prebuilt V8.
+
+These totals were counted before the renderer was replaced — wgpu and WGSL out, Direct3D 11 (HLSL)
+and Skia in, distance-field text out — and have not been recounted since. The two new backend rows
+below give the number of `#[test]` functions in their sources instead.
 
 | Crate | Tests | Status |
 |---|---|---|
 | `spherekit-core` | 117 | Done |
 | `spherekit-render` | 108 | Done |
-| `spherekit-wgpu` | 42 (4 on a real GPU) | Done |
+| `spherekit-d3d11` | 38 `#[test]` functions (offscreen on hardware or WARP) | Done |
+| `spherekit-skia` | 53 `#[test]` functions, plus an ignored benchmark | Done |
 | `spherekit-text` | 284 | Done |
 | `spherekit-layout` | 108 | Done |
 | `spherekit-image` | 95 | Done |
@@ -37,11 +42,14 @@ lower: `spherekit-jsengine`'s 19 tests and `spherekit-bridge`'s 7 V8 tests need 
 
 ### Phase 0 — Foundation · **DONE**
 
-Cargo workspace, core geometry, colour, window, wgpu initialisation, surface, swapchain
+Cargo workspace, core geometry, colour, window, GPU initialisation, surface, swapchain
 configuration, frame lifecycle, clear colour, diagnostics.
 
 *Success criterion — a native window opens and renders reliably.* Met, and verified by running it:
-the demo opens on an NVIDIA GTX 1060 through Vulkan and presents 181 frames.
+the demo opened on an NVIDIA GTX 1060 through wgpu on Vulkan and presented 181 frames. wgpu has since
+been replaced by `spherekit-d3d11` (Direct3D 11 through DirectComposition) on Windows and
+`spherekit-skia` (Skia on the CPU) as the fallback and the Linux/macOS backend; see
+`docs/rendering.md`.
 
 ### Phase 1 — Primitive renderer · **DONE**
 
@@ -55,16 +63,21 @@ compatible rectangles merge into a single draw call.
 
 ### Phase 2 — Text · **DONE**
 
-Font loading, font database, fallback, shaping, glyph runs, MTSDF generation, paged atlas, GPU text
-shader, HiDPI, multilingual text.
+Font loading, font database, fallback, shaping, glyph runs, coverage rasterisation, paged atlas,
+text shader, HiDPI, multilingual text.
 
-*Success criterion — text renders correctly at common DAW UI sizes.* Met. Glyph quads are snapped
-to the device pixel grid — the baseline always, and a bitmap glyph's origin and extent as well, so
-the atlas's edge-aligned UV convention actually holds — and coverage carries a perceptual gamma so
-light-on-dark text does not bloom in linear light. The MTSDF generator is a
-pure-Rust implementation of Chlumsky's method including edge colouring, pseudo-distance and error
-correction; the small-size bitmap fallback is an analytic-coverage rasteriser selected on physical
-size. The demo renders Latin, Thai, Japanese, Chinese, Korean and Arabic through one path.
+*Success criterion — text renders correctly at common DAW UI sizes.* Met. Every glyph is a coverage
+bitmap at its exact device size and one of four quarter-pixel phases, grayscale or RGB subpixel,
+rasterised by DirectWrite on Windows and by a pure-Rust analytic-coverage rasteriser with vertical
+grid fitting everywhere else. Glyph quads are snapped to the device pixel grid so the atlas's
+edge-aligned UV convention actually holds, and coverage carries a perceptual correction so text does
+not bloom in linear light. The demo renders Latin, Thai, Japanese, Chinese, Korean and Arabic
+through one path.
+
+Phase 2 originally shipped multi-channel signed distance fields (a pure-Rust MTSDF generator) with a
+small-size bitmap fallback. They were removed with the move to Direct3D 11 and Skia: bitmaps are
+sharper at interface sizes, can be grid-fitted, and cost the CPU backend nothing to draw. The
+reasoning is in `docs/text.md`.
 
 ### Phase 3 — Layout · **DONE**
 
@@ -166,8 +179,8 @@ parsing and `SvgError::Unsupported` is returned rather than handing back a silen
 | Multisample antialiasing for paths | Done — 4× by default, on the surface and every layer |
 | Gaussian blur | Done — separable two-pass layer filter |
 | Backdrop blur | Done — destination snapshot plus separable two-pass filter |
-| Colour matrix | Type exists, shader path not written |
-| Blend modes beyond fixed-function | Layers open correctly; the shader does not implement them |
+| Colour matrix | Done on Skia; not applied on Direct3D 11 |
+| Blend modes beyond fixed-function | Done on Skia; Direct3D 11 composites every layer with normal blending |
 | Glow, bloom, mask, reflection, glass | Not started |
 
 `SphereKitSurface` runs the two-pass blur between a filtered layer's render and its composite.
@@ -269,25 +282,24 @@ See [`docs/api-bridge.md`](api-bridge.md).
 
 ### Phase 11 — JavaScript runtime · **PARTIAL**
 
-`spherekit-jsengine` embeds V8 through a hand-written C++ shim. The public Rust surface owns an
+`spherekit-jsengine` embeds V8 through rusty_v8 (the `v8` crate). The public Rust surface owns an
 `Engine` and never lets a `v8::Local<T>` out, because isolates are thread-affine and local handles
-are stack-scoped — the shim opens its scopes, does the work, and returns owned UTF-8.
+are stack-scoped — each method opens its scopes, does the work, and returns owned UTF-8.
 
-*Success criterion — React's production bundle evaluates and renders in a bare isolate.* Met on
-Windows.
+*Success criterion — React's production bundle evaluates and renders in a bare isolate.* Met.
 
 | Feature | Status |
 |---|---|
 | `eval`, `eval_named`, `bind`, `call_global`, `has_global` | Done |
 | Explicit microtask policy; `run_microtasks` and a bounded `pump` | Done |
 | Exceptions with message, stack, line, column and script name as separate fields | Done |
-| Panic containment at the FFI boundary | Done |
+| Panic containment in host callbacks | Done |
 | `runtime/prelude.js`: timers, frame callbacks, `console`, `performance`, `navigator` | Done |
 | `JsBridge`: isolate wired to an `ApiBridge` through two globals | Done |
-| **Targets other than Windows x86_64** | **Not started** — the shim is portable C++20; the *prebuilt* is not. The non-Windows `Engine` is a complete API mirror that returns `UnsupportedPlatform` |
+| Targets other than Windows x86_64 | Done — rusty_v8 ships prebuilts for Windows, Linux and macOS (x86_64, aarch64); only Windows is exercised locally |
 | **ES modules** | **Not started** — the application must arrive as one IIFE bundle |
 | **`fetch`, `URL`, `TextEncoder`, `structuredClone`** | **Not started** — the prelude supplies only what React's module evaluation reaches for |
-| **A debugger or inspector protocol** | **Not started** — `js_protocol.pdl` ships with the prebuilt; nothing serves it |
+| **A debugger or inspector protocol** | **Not started** — rusty_v8 exposes `v8::inspector`; nothing serves it |
 | **Snapshots or code cache** | **Not started** — the bundle is parsed from source on every start |
 
 The `v8` feature is off by default everywhere, and `spherekit-bridge` compiles with no JavaScript
@@ -309,9 +321,9 @@ Not built: no `spherekit dev` with a watch loop, no packaging or installer step,
 | Criterion | Status |
 |---|---|
 | Windows, Linux, macOS architecturally supported | Yes — one `cfg`-gated backend module, no platform code above it |
-| A WGPU window renders reliably | Yes — verified by running it |
+| A GPU window renders reliably | Yes — verified by running it, first on wgpu, now on Direct3D 11 |
 | Core primitives GPU accelerated | Yes |
-| Text shaping and MTSDF rendering work | Yes |
+| Text shaping and glyph rendering work | Yes — distance fields at first, coverage bitmaps now |
 | Thai and Japanese text render correctly | Yes — in the demo and in tests |
 | DPI scaling works | Yes — fractional scaling tested at 1.0/1.25/1.5/1.75/2.0 |
 | A retained node tree exists | Yes |
@@ -320,8 +332,8 @@ Not built: no `spherekit dev` with a watch loop, no packaging or installer step,
 | Basic input and hit testing work | Yes |
 | Basic widgets exist | Partial — see Phase 5 |
 | A realtime meter updates without full relayout | Yes — tested |
-| The public API is not tied to WGPU | Yes — `RendererBackend` is the only seam |
-| No Skia/C++ rendering dependency remains | Yes — pure Rust throughout. The only C++ in the workspace is the V8 shim, which draws nothing |
+| The public API is not tied to a graphics API | Yes — `RendererBackend` is the only seam, and replacing wgpu proved it |
+| No Skia/C++ rendering dependency remains | **No longer.** This was met at v0.1; Skia (prebuilt binaries via `skia-safe`) is now the CPU backend. Direct3D 11, DirectWrite and everything above the renderer remain pure Rust over OS APIs |
 | A stylesheet styles native and React elements alike | Yes — one `Stylesheet`, two producers, asserted in both crates |
 | React renders native widgets with no DOM | Yes — `app/reactdemo`, React 19 in an in-process isolate |
 | Examples and documentation demonstrate the architecture | Yes — five runnable applications, three diagnostic examples, twelve documents |
@@ -346,11 +358,11 @@ Not built: no `spherekit dev` with a watch loop, no packaging or installer step,
 6. **Remaining widgets.** Menu, tabs, tooltip, modal, list, tree.
 7. **Accessibility bridge.** Every element already reports role, value, state and actions. No
    platform bridge (UI Automation, AT-SPI, NSAccessibility) consumes them yet.
-8. **Golden-image tests.** Visual regressions are currently caught by eye.
-9. **V8 on Linux and macOS.** The shim is portable C++20 against the public V8 API; only the
-   prebuilt is Windows-only. Until a monolith exists for the other two, React on them means a
-   WebView or a child process driving the same bridge. What the port involves is written down in
-   `docs/javascript.md`.
+8. **Golden-image tests.** Visual regressions are currently caught by eye. The readback they need
+   now exists — `SphereKitSurface::new_offscreen` and `read_pixels` on both backends, used by the
+   `screenshot` example — but nothing compares frames against stored references yet.
+9. **V8 on Linux and macOS in CI.** rusty_v8 provides the prebuilts; CI does not yet build or
+   test the `v8` feature on those targets.
 10. **Scroll, focus and keyboard events in React.** No React prop reaches the focus, keyboard or IME
     machinery the native widgets already have, and `ScrollView` reports no offset to lower into an
     `onScroll`. The gap is a lowering and a `spherekit-ui` builder, not a design question.
@@ -359,9 +371,13 @@ Not built: no `spherekit dev` with a watch loop, no packaging or installer step,
 
 ## Beyond v0.1
 
-- Web and WASM through WebGPU. `wgpu` already supports the target; the platform layer does not.
-- A native D3D12 backend, if measurement ever shows wgpu's abstraction costing something that
-  matters.
+- Web and WASM. Neither backend targets the browser, so this now needs a new `RendererBackend` as
+  well as a platform layer.
+- A GPU backend for Linux and macOS, which render through Skia on the CPU today. The batch
+  compiler's output was designed for instanced shaders, so a Metal or Vulkan port is a backend, not
+  a redesign.
+- Layer blend modes and `Filter::ColorMatrix` on Direct3D 11, and GPU timestamps for
+  `FrameStats::gpu_ms`.
 - Compute-shader blur, for the cases where the separable fragment path is not enough.
 - HDR and wide-gamut output. `SurfaceColorSpace` is plumbed through; nothing uses it yet.
 - Virtualised lists for very large sessions.

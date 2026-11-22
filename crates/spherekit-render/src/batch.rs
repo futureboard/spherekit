@@ -22,7 +22,7 @@ use crate::primitives::{
 };
 use crate::scene::{
     ClipKind, DrawCommand, Filter, Layer, Mesh, MeshVertex, NO_INDEX, QuadCommand, Scene,
-    SceneIndex, SceneStats, TextRasterMode,
+    SceneIndex, SceneStats,
 };
 use crate::tessellate::{TessellationOptions, Tessellator};
 use core::ops::Range;
@@ -55,11 +55,9 @@ pub struct GlyphRequest {
     pub glyph: GlyphId,
     /// Font size in logical pixels.
     pub font_size: Px,
-    /// The surface scale factor, so the provider can decide MTSDF vs bitmap
-    /// from the *physical* size rather than the logical one.
+    /// The surface scale factor. Glyphs are rasterised at their *physical*
+    /// size, `font_size * device_scale`.
     pub device_scale: f32,
-    /// The caller's rasterisation preference.
-    pub mode: TextRasterMode,
     /// Whether an RGB-stripe subpixel bitmap may be returned.
     ///
     /// This is only set for direct rendering to an opaque surface with a
@@ -69,8 +67,8 @@ pub struct GlyphRequest {
     pub subpixel: bool,
     /// Quarter-pixel horizontal raster phase in `0..=3`.
     ///
-    /// Bitmap providers include this in their cache key and offset the outline
-    /// by `subpixel_phase / 4` before rasterisation. Distance fields ignore it.
+    /// Providers include this in their cache key and offset the outline by
+    /// `subpixel_phase / 4` before rasterisation.
     pub subpixel_phase: u8,
 }
 
@@ -83,15 +81,8 @@ pub struct GlyphPlacement {
     pub uv: [f32; 4],
     /// Ink bounds in em units, pen-relative, y-down: `[x, y, w, h]`.
     pub bounds_em: [f32; 4],
-    /// The distance field's range in em units. Zero for a bitmap.
-    pub range_em: f32,
-    /// True when the placement is a size-specific coverage bitmap rather than
-    /// a distance field. This includes grayscale and RGB subpixel bitmaps.
-    pub is_bitmap: bool,
-    /// True when the bitmap stores independent RGB subpixel coverage.
-    ///
-    /// This implies [`GlyphPlacement::is_bitmap`] and selects the dual-source
-    /// text pipeline.
+    /// True when the bitmap stores independent RGB subpixel coverage, which
+    /// selects the dual-source text pipeline. Otherwise it is grayscale.
     pub is_subpixel: bool,
     /// The glyph's size in atlas texels.
     ///
@@ -114,13 +105,10 @@ pub trait TextureProvider {
 pub enum BatchKind {
     /// Analytic rectangles, rounded rectangles, borders and shadows.
     Quad,
-    /// Text, sampling one atlas page.
+    /// Text, sampling one atlas page of coverage bitmaps.
     Glyph {
         /// The atlas page this batch samples.
         page: u32,
-        /// True when the page holds coverage bitmaps rather than distance
-        /// fields, which the shader needs to know.
-        bitmap: bool,
         /// True when this page stores RGB subpixel coverage and therefore needs
         /// the dual-source blend pipeline.
         subpixel: bool,
@@ -281,7 +269,7 @@ pub struct BatchCompiler {
     time: f32,
     /// Whether the final surface can accept RGB subpixel coverage.
     ///
-    /// Defaults off so non-wgpu and test backends degrade safely. The surface
+    /// Defaults off so the Skia and test backends degrade safely. The surface
     /// integration enables it only for an opaque target backed by a device with
     /// dual-source blending.
     subpixel_text_enabled: bool,
@@ -572,11 +560,34 @@ impl BatchCompiler {
         if end == self.pass_start && composite.is_none() {
             return;
         }
+        // A composite *writes* its destination too, so the destination has to
+        // have been cleared before it lands. When a layer is the first thing a
+        // target receives — a layer at the very start of the frame — nothing
+        // has cleared that target yet, and its first own pass would otherwise
+        // clear *after* the composite and wipe the layer out. An empty pass
+        // that only clears goes in front instead.
+        if let Some(destination) = composite.as_ref().map(|c| c.destination)
+            && !self.target_written(destination)
+        {
+            self.frame.passes.push(Pass {
+                target: destination,
+                batches: self.pass_start..self.pass_start,
+                clear: true,
+                composite: None,
+            });
+        }
         // A target is cleared by the first pass that writes it. Offscreen
         // layers always start blank; the surface is cleared once per frame.
-        let clear = !self.frame.passes.iter().any(|p| p.target == target);
+        let clear = !self.target_written(target);
         self.frame.passes.push(Pass { target, batches: self.pass_start..end, clear, composite });
         self.pass_start = end;
+    }
+
+    /// Whether any pass so far draws into or composites into `target`.
+    fn target_written(&self, target: u32) -> bool {
+        self.frame.passes.iter().any(|p| {
+            p.target == target || p.composite.as_ref().is_some_and(|c| c.destination == target)
+        })
     }
 
     #[inline]
@@ -712,7 +723,7 @@ impl BatchCompiler {
                 }
                 Brush::Gradient(g) => {
                     flags |= quad_flags::FILL_GRADIENT;
-                    gradient = self.intern_gradient(q.fill, g);
+                    gradient = self.intern_gradient(q.fill, g, paint.opacity);
                     // The shader still needs a base color for the degenerate
                     // single-stop case and for premultiplied alpha maths.
                     color = g.sample(0.0).scale_alpha(paint.opacity).to_linear();
@@ -821,8 +832,6 @@ impl BatchCompiler {
 
         let size = run.font_size.get();
         let scale = scene.scale_factor.get();
-        let outline = run.outline_width > Px::ZERO;
-        let outline_color = run.outline_color.to_linear();
 
         // Snapping is only meaningful when the transform is a translation: under
         // rotation or non-uniform scale there is no pixel grid to snap to, and
@@ -834,19 +843,15 @@ impl BatchCompiler {
         // surface. An intermediate texture would collapse those three coverage
         // values into ordinary RGBA before its opacity/filter/transform is
         // known, producing coloured fringes when it is composited later.
-        let allow_subpixel = self.subpixel_text_enabled
-            && self.target_stack.is_empty()
-            && snappable
-            // The RGB coverage bitmap has no signed-distance information from
-            // which the text shader could reconstruct a synthetic outline.
-            && !outline;
+        let allow_subpixel =
+            self.subpixel_text_enabled && self.target_stack.is_empty() && snappable;
 
         for g in &run.glyphs {
             // Split the device-space pen into an integral placement plus one of
             // four cached raster phases. The outline is shifted by the phase in
             // the provider while the resulting bitmap is drawn at the integral
             // pen, so the fractional position is applied exactly once.
-            let (bitmap_pen_x, subpixel_phase) = if snappable && scale > 0.0 {
+            let (pen_x, subpixel_phase) = if snappable && scale > 0.0 {
                 let device_pen = (g.position.x.get() + translation.width.get()) * scale;
                 let (integral, phase) = quarter_pixel_bin(device_pen);
                 (Px(integral as f32 / scale - translation.width.get()), phase)
@@ -858,7 +863,6 @@ impl BatchCompiler {
                 glyph: g.glyph,
                 font_size: run.font_size,
                 device_scale: scale,
-                mode: run.raster,
                 subpixel: allow_subpixel,
                 subpixel_phase,
             }) else {
@@ -869,29 +873,15 @@ impl BatchCompiler {
                 continue;
             }
 
-            // The atlas image covers the glyph's ink box outset by the field's
-            // range on every side, and `generate_mtsdf` is explicit that the
-            // quad has to match. Drawing the ink box alone squeezes the whole
-            // padded image into it, which shrinks every glyph by
-            // `ink / (ink + 2 * range)` -- around 75 % for a typical lowercase
-            // letter -- while its advance stays correct, so a line comes out
-            // small and tracked out. `range_em` is zero for a bitmap, so one
-            // unconditional outset is right for both paths.
-            debug_assert!(!p.is_subpixel || p.is_bitmap);
-            let pad = p.range_em * size;
-            let pen_x = if p.is_bitmap { bitmap_pen_x } else { g.position.x };
             let mut bounds = Rect::new(
                 Point::new(
-                    Px(pen_x.get() + p.bounds_em[0] * size - pad),
-                    Px(g.position.y.get() + p.bounds_em[1] * size - pad),
+                    Px(pen_x.get() + p.bounds_em[0] * size),
+                    Px(g.position.y.get() + p.bounds_em[1] * size),
                 ),
-                Size::new(
-                    Px(p.bounds_em[2] * size + 2.0 * pad),
-                    Px(p.bounds_em[3] * size + 2.0 * pad),
-                ),
+                Size::new(Px(p.bounds_em[2] * size), Px(p.bounds_em[3] * size)),
             );
             if snappable {
-                bounds = snap_glyph_quad(bounds, g.position, &p, translation, scale);
+                bounds = snap_glyph_quad(bounds, &p, translation, scale);
             }
 
             let Some((rc, scissor)) = self.visible(scene, bounds, transform, clip, viewport) else {
@@ -899,12 +889,6 @@ impl BatchCompiler {
             };
 
             let mut flags = 0u32;
-            if p.is_bitmap {
-                flags |= glyph_flags::BITMAP;
-            }
-            if outline {
-                flags |= glyph_flags::OUTLINE;
-            }
             if rc.needs_shader_clip {
                 flags |= glyph_flags::CLIP_ROUNDED;
             }
@@ -913,7 +897,7 @@ impl BatchCompiler {
             }
 
             self.push_instance(
-                BatchKind::Glyph { page: p.page, bitmap: p.is_bitmap, subpixel: p.is_subpixel },
+                BatchKind::Glyph { page: p.page, subpixel: p.is_subpixel },
                 scissor,
                 1,
             );
@@ -926,12 +910,6 @@ impl BatchCompiler {
                 ],
                 uv: p.uv,
                 color: color.to_array(),
-                outline_color: outline_color.to_array(),
-                // The field's em range becomes a destination-pixel range once
-                // multiplied by the font size and the surface scale. This is
-                // what lets one batch mix sizes and still antialias correctly.
-                px_range: (p.range_em * size * scale).max(1e-3),
-                outline_width: run.outline_width.get(),
                 // A non-finite exponent would make `pow` in the shader produce
                 // NaN coverage, which shows as a black block. The sign is
                 // meaningful here — it picks which end of the ramp bends — so
@@ -942,14 +920,7 @@ impl BatchCompiler {
                 } else {
                     1.0
                 },
-                // The size the small-text compensation keys off. The vertex
-                // stage multiplies it by the transform's scale, exactly as it
-                // does `px_range`, so a zoomed panel is compensated for the
-                // size it actually appears at rather than the size it was
-                // recorded at.
-                em_px: size * scale,
                 flags,
-                atlas_page: p.page,
                 transform_index: transform,
                 clip_index: rc.gpu_index,
             });
@@ -1159,44 +1130,49 @@ impl BatchCompiler {
         self.frame.mesh_indices.extend(mesh.indices.iter().map(|i| i + base));
     }
 
-    fn intern_gradient(&mut self, paint_index: SceneIndex, g: &spherekit_core::Gradient) -> u32 {
+    /// Interns a paint's gradient, with the paint's opacity folded into every
+    /// stop. The stops are premultiplied, so opacity scales all four channels;
+    /// the cache is keyed by paint, and opacity is a property of the paint.
+    fn intern_gradient(
+        &mut self,
+        paint_index: SceneIndex,
+        g: &spherekit_core::Gradient,
+        opacity: f32,
+    ) -> u32 {
         if let Some(i) = self.gradient_map.get(&paint_index) {
             return *i;
         }
         let i = self.frame.gradients.len() as u32;
-        self.frame.gradients.push(GpuGradient::from_gradient(g));
+        let mut gpu = GpuGradient::from_gradient(g);
+        let opacity = if opacity.is_finite() { opacity.clamp(0.0, 1.0) } else { 1.0 };
+        if opacity < 1.0 {
+            for stop in &mut gpu.colors {
+                for channel in stop.iter_mut() {
+                    *channel *= opacity;
+                }
+            }
+        }
+        self.frame.gradients.push(gpu);
         self.gradient_map.insert(paint_index, i);
         i
     }
 }
 
-/// Aligns a glyph quad to the device pixel grid.
+/// Snaps a glyph quad onto the device pixel grid.
 ///
-/// The correction has to be *uniform across a run*, which is the part that is
-/// easy to get wrong. Every glyph has a different ink top — an `x`, an `l` and
-/// a `g` all begin at different heights — so rounding each quad's own top edge
-/// hands every glyph in the line a different sub-pixel shift and pulls the
-/// shared baseline apart. The shift is derived from the pen instead, which
-/// every glyph in the run shares, and applied as one common delta.
-///
-/// Two separate problems, with two different answers:
-///
-/// * **Vertical.** A baseline at a fractional device y softens every glyph in
-///   the run, distance field or not, and the softening is identical for all of
-///   them, so nothing is gained by leaving it fractional. Always snapped.
-/// * **Horizontal.** A distance field reconstructs correctly at any subpixel x,
-///   and snapping it would visibly quantise letter spacing at small sizes — so
-///   MTSDF glyphs keep their exact x. A *bitmap* glyph has no such property:
-///   sampled at a fractional offset it is a blurred copy of itself, so its
-///   origin **and** its extent are snapped, the extent to the exact texel count
-///   the atlas allocated.
+/// Every glyph is a coverage bitmap rasterised for one exact device size and
+/// one quarter-pixel phase. Sampled at a fractional offset, or stretched by a
+/// fraction of a texel, it is a blurred copy of itself, so both its origin and
+/// its extent are snapped — the extent to the exact texel count the atlas
+/// allocated. The rasteriser already snaps each ink box outwards to whole
+/// device pixels from the pen, so rounding the quad directly is grid-exact and
+/// keeps a whole run on one shared baseline.
 ///
 /// This is what makes the atlas's edge-aligned UV convention actually hold: it
 /// promises that a 1:1, pixel-aligned quad samples texel centres, and nothing
-/// else in the pipeline was arranging for the quad to be either.
+/// else in the pipeline arranges for the quad to be either.
 fn snap_glyph_quad(
     bounds: Rect<Px>,
-    pen: Point<Px>,
     placement: &GlyphPlacement,
     translation: Size<Px>,
     scale: f32,
@@ -1204,36 +1180,18 @@ fn snap_glyph_quad(
     if scale <= 0.0 {
         return bounds;
     }
-    // Work in the device space the vertex stage will land in, which is the only
-    // space where "the pixel grid" means anything.
     let device_x = (bounds.min_x().get() + translation.width.get()) * scale;
     let device_y = (bounds.min_y().get() + translation.height.get()) * scale;
-
-    // A bitmap's ink box is already a whole number of device pixels from the pen
-    // — `rasterize_shape` snaps it outwards on purpose — so rounding the quad
-    // directly is both grid-exact and consistent across the run, and this is the
-    // only case where the extent may be overridden.
-    if placement.is_bitmap {
-        return Rect::new(
-            Point::new(
-                Px(device_x.round() / scale - translation.width.get()),
-                Px(device_y.round() / scale - translation.height.get()),
-            ),
-            Size::new(
-                Px(placement.texel_size[0] as f32 / scale),
-                Px(placement.texel_size[1] as f32 / scale),
-            ),
-        );
-    }
-
-    // A field's padded box sits a fractional, glyph-dependent distance above the
-    // baseline, so rounding each quad's own top edge would give every glyph in
-    // the run a different sub-pixel shift. The pen is what they share, so that
-    // is what gets rounded, and the whole quad moves by the same delta. The size
-    // is left exactly as the field requires.
-    let baseline = (pen.y.get() + translation.height.get()) * scale;
-    let dy = (baseline.round() - baseline) / scale;
-    Rect::new(Point::new(bounds.min_x(), Px(bounds.min_y().get() + dy)), bounds.size)
+    Rect::new(
+        Point::new(
+            Px(device_x.round() / scale - translation.width.get()),
+            Px(device_y.round() / scale - translation.height.get()),
+        ),
+        Size::new(
+            Px(placement.texel_size[0] as f32 / scale),
+            Px(placement.texel_size[1] as f32 / scale),
+        ),
+    )
 }
 
 /// Quantises a horizontal device-space pen to the nearest quarter pixel.
@@ -1270,8 +1228,6 @@ mod tests {
                 page: if self.page == 0 { 0 } else { (r.glyph.0 as u32) % self.page },
                 uv: [0.0, 0.0, 0.1, 0.1],
                 bounds_em: [0.0, -0.8, 0.6, 0.8],
-                range_em: 0.1,
-                is_bitmap: false,
                 is_subpixel: false,
                 texel_size: [24, 32],
             })
@@ -1466,6 +1422,36 @@ mod tests {
         assert_eq!(f.passes.iter().filter(|p| p.target == 0 && p.clear).count(), 1);
     }
 
+    /// The regression: a layer that is the first thing in the frame composites
+    /// into a surface nothing has cleared, and the surface's first own pass —
+    /// marked to clear — then wiped the layer out.
+    #[test]
+    fn a_layer_at_the_start_of_the_frame_is_not_cleared_away() {
+        let mut s = scene();
+        {
+            let mut c = Canvas::new(&mut s);
+            c.push_opacity_layer(rect(px(0.0), px(0.0), px(50.0), px(50.0)), 0.5);
+            c.fill_rect(rect(px(0.0), px(0.0), px(50.0), px(50.0)), Color::BLUE);
+            c.end_layer();
+            c.fill_rect(rect(px(60.0), px(0.0), px(10.0), px(10.0)), Color::GREEN);
+        }
+        let f = compile(&s);
+        let surface_clears: Vec<usize> = f
+            .passes
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.target == 0 && p.clear)
+            .map(|(i, _)| i)
+            .collect();
+        let composite_into_surface = f
+            .passes
+            .iter()
+            .position(|p| p.composite.as_ref().is_some_and(|c| c.destination == 0))
+            .expect("the layer composites into the surface");
+        assert_eq!(surface_clears.len(), 1, "{:#?}", f.passes);
+        assert!(surface_clears[0] < composite_into_surface, "cleared after the composite");
+    }
+
     /// A layer's coordinate space has to sit on the device grid, because
     /// `snap_glyph_quad` rounds glyphs in absolute device coordinates and knows
     /// nothing about which target they will land in. A fractional target origin
@@ -1563,9 +1549,6 @@ mod tests {
                     font: FontId::new(0, 1),
                     font_size: px(16.0),
                     glyphs,
-                    raster: TextRasterMode::Mtsdf,
-                    outline_width: Px::ZERO,
-                    outline_color: Color::TRANSPARENT,
                     coverage_contrast: crate::scene::FULL_COVERAGE_CONTRAST,
                 },
                 Color::WHITE,
@@ -1580,26 +1563,6 @@ mod tests {
     }
 
     /// A provider that reports a bitmap glyph of a known texel size.
-    /// Two glyphs whose ink tops differ, which is the case that catches a
-    /// snapping rule applied per glyph instead of per run. Both sit on the same
-    /// baseline, as every glyph in a real run does.
-    struct StubVariedGlyphs;
-    impl GlyphProvider for StubVariedGlyphs {
-        fn place_glyph(&mut self, r: GlyphRequest) -> Option<GlyphPlacement> {
-            // Deliberately fractional: an `x`-height glyph and an ascender.
-            let top = if r.glyph.0 == 1 { -0.517 } else { -0.733 };
-            Some(GlyphPlacement {
-                page: 0,
-                uv: [0.0, 0.0, 0.1, 0.1],
-                bounds_em: [0.0, top, 0.6, -top],
-                range_em: 0.1,
-                is_bitmap: false,
-                is_subpixel: false,
-                texel_size: [24, 32],
-            })
-        }
-    }
-
     struct StubBitmapGlyphs;
     impl GlyphProvider for StubBitmapGlyphs {
         fn place_glyph(&mut self, _: GlyphRequest) -> Option<GlyphPlacement> {
@@ -1609,8 +1572,6 @@ mod tests {
                 // Deliberately awkward: 0.37 em at 11 px is 4.07 device px, so
                 // an unsnapped quad lands off the grid and off the texel count.
                 bounds_em: [0.13, -0.61, 0.37, 0.72],
-                range_em: 0.0,
-                is_bitmap: true,
                 is_subpixel: false,
                 texel_size: [4, 8],
             })
@@ -1632,8 +1593,6 @@ mod tests {
                 page: u32::from(is_subpixel),
                 uv: [0.0, 0.0, 0.1, 0.1],
                 bounds_em: [0.0, -0.75, 0.5, 0.75],
-                range_em: 0.0,
-                is_bitmap: true,
                 is_subpixel,
                 texel_size: [6, 9],
             })
@@ -1652,9 +1611,6 @@ mod tests {
                         glyph: GlyphId(1),
                         position: Point::new(px(x), px(y)),
                     }],
-                    raster: TextRasterMode::Auto,
-                    outline_width: Px::ZERO,
-                    outline_color: Color::TRANSPARENT,
                     coverage_contrast: crate::scene::FULL_COVERAGE_CONTRAST,
                 },
                 Color::WHITE,
@@ -1725,9 +1681,6 @@ mod tests {
                         glyph: GlyphId(1),
                         position: Point::new(px(10.3), px(20.0)),
                     }],
-                    raster: TextRasterMode::Bitmap,
-                    outline_width: Px::ZERO,
-                    outline_color: Color::TRANSPARENT,
                     coverage_contrast: crate::scene::FULL_COVERAGE_CONTRAST,
                 },
                 Color::WHITE,
@@ -1747,21 +1700,6 @@ mod tests {
     }
 
     #[test]
-    fn outlined_text_does_not_request_an_rgb_coverage_bitmap() {
-        let mut s = glyph_run_at(10.3, 20.0, 11.0);
-        s.runs[0].outline_width = px(1.0);
-        s.runs[0].outline_color = Color::BLACK;
-
-        let mut compiler = BatchCompiler::new();
-        compiler.set_subpixel_text_enabled(true);
-        let mut glyphs = EchoSubpixelGlyphs::default();
-        compiler.compile(&s, &mut glyphs, &mut StubTextures(true));
-
-        assert_eq!(glyphs.requests.len(), 1);
-        assert!(!glyphs.requests[0].subpixel);
-    }
-
-    #[test]
     fn snapping_accounts_for_the_scale_factor() {
         // At 2x, a logical position of 10.25 is device 20.5 and must land on 20
         // or 21 — snapping in logical space would leave it at 20.5.
@@ -1776,9 +1714,6 @@ mod tests {
                         glyph: GlyphId(1),
                         position: Point::new(px(10.25), px(20.13)),
                     }],
-                    raster: TextRasterMode::Auto,
-                    outline_width: Px::ZERO,
-                    outline_color: Color::TRANSPARENT,
                     coverage_contrast: crate::scene::FULL_COVERAGE_CONTRAST,
                 },
                 Color::WHITE,
@@ -1793,217 +1728,9 @@ mod tests {
     }
 
     #[test]
-    fn a_distance_field_glyph_keeps_its_subpixel_x_but_snaps_its_baseline() {
-        // A field reconstructs correctly at any subpixel x, and quantising x
-        // would visibly quantise letter spacing at small sizes. The baseline
-        // gains nothing from being fractional, so it is snapped -- but it is the
-        // *baseline* that lands on the grid, not the quad's top edge, which sits
-        // a fractional ink height above it.
-        let s = glyph_run_at(10.3, 20.7, 24.0);
-        let mut c = BatchCompiler::new();
-        let f = c.compile(&s, &mut StubGlyphs { page: 0, calls: 0 }, &mut StubTextures(true));
-
-        let g = &f.glyphs[0];
-        assert_ne!(g.bounds[0].fract(), 0.0, "MTSDF x should keep its subpixel offset");
-
-        // Recover the baseline the quad implies: top edge, plus the padding the
-        // field adds, minus the ink top the stub reports.
-        let (pad, ink_top) = (0.1 * 24.0, -0.8 * 24.0);
-        let baseline = g.bounds[1] + pad - ink_top;
-        assert!((baseline - baseline.round()).abs() < 1e-4, "baseline landed at {baseline}");
-    }
-
-    /// The two halves of the same rule, checked in *device* space at every
-    /// scale factor a Windows display actually reports.
-    ///
-    /// Snapping the baseline in logical space would leave 20.5 device pixels
-    /// alone at 2x and soften every glyph in the run identically; quantising x
-    /// would clump letter spacing at exactly the sizes where the field is the
-    /// only path available. The existing single-scale test covers 1x, where the
-    /// two spaces coincide and the distinction is invisible.
-    #[test]
-    fn a_field_baseline_lands_on_a_physical_pixel_while_x_keeps_its_fraction() {
-        for scale in [1.0f32, 1.25, 1.5, 2.0, 3.0] {
-            let mut s = Scene::new(size2(px(800.0), px(600.0)), ScaleFactor::new(scale));
-            // Deliberately fractional in both axes, and fractional again once
-            // multiplied by every scale above.
-            let (pen_x, pen_y, size) = (10.3f32, 20.7f32, 24.0f32);
-            {
-                let mut c = Canvas::new(&mut s);
-                c.draw_glyph_run(
-                    crate::scene::GlyphRun {
-                        font: FontId::new(0, 1),
-                        font_size: px(size),
-                        glyphs: smallvec::smallvec![crate::scene::PositionedGlyph {
-                            glyph: GlyphId(1),
-                            position: Point::new(px(pen_x), px(pen_y)),
-                        }],
-                        raster: TextRasterMode::Mtsdf,
-                        outline_width: Px::ZERO,
-                        outline_color: Color::TRANSPARENT,
-                        coverage_contrast: crate::scene::FULL_COVERAGE_CONTRAST,
-                    },
-                    Color::WHITE,
-                );
-            }
-            let mut c = BatchCompiler::new();
-            let f = c.compile(&s, &mut StubGlyphs { page: 0, calls: 0 }, &mut StubTextures(true));
-            let g = &f.glyphs[0];
-
-            // Recover the baseline the quad implies, in device pixels: the top
-            // edge, plus the padding the field adds, minus the stub's ink top.
-            let (pad, ink_top) = (0.1 * size, -0.8 * size);
-            let baseline = (g.bounds[1] + pad - ink_top) * scale;
-            assert!(
-                (baseline - baseline.round()).abs() < 1e-3,
-                "scale {scale}: baseline landed at {baseline} device px"
-            );
-
-            // And x is untouched, which is only meaningful because it was
-            // fractional to begin with.
-            let device_x = (g.bounds[0] + pad) * scale;
-            assert!((g.bounds[0] + pad - pen_x).abs() < 1e-4, "scale {scale}: x moved");
-            assert!(
-                (device_x - device_x.round()).abs() > 1e-3,
-                "scale {scale}: x was quantised to {device_x}"
-            );
-        }
-    }
-
-    /// The compensation keys off the size the glyph appears at, so the size has
-    /// to travel with the instance. The vertex stage multiplies it by the
-    /// transform's scale, exactly as it does `px_range`.
-    #[test]
-    fn a_field_glyph_carries_its_device_em_size() {
-        for (scale, size) in [(1.0f32, 13.0f32), (2.0, 13.0), (1.5, 11.0), (1.0, 32.0)] {
-            let mut s = Scene::new(size2(px(800.0), px(600.0)), ScaleFactor::new(scale));
-            {
-                let mut c = Canvas::new(&mut s);
-                c.draw_glyph_run(
-                    crate::scene::GlyphRun {
-                        font: FontId::new(0, 1),
-                        font_size: px(size),
-                        glyphs: smallvec::smallvec![crate::scene::PositionedGlyph {
-                            glyph: GlyphId(1),
-                            position: Point::new(px(10.0), px(30.0)),
-                        }],
-                        raster: TextRasterMode::Mtsdf,
-                        outline_width: Px::ZERO,
-                        outline_color: Color::TRANSPARENT,
-                        coverage_contrast: crate::scene::FULL_COVERAGE_CONTRAST,
-                    },
-                    Color::WHITE,
-                );
-            }
-            let mut c = BatchCompiler::new();
-            let f = c.compile(&s, &mut StubGlyphs { page: 0, calls: 0 }, &mut StubTextures(true));
-            assert!(
-                (f.glyphs[0].em_px - size * scale).abs() < 1e-4,
-                "{size} px at {scale}x carried {}",
-                f.glyphs[0].em_px
-            );
-        }
-    }
-
-    /// What "2x is unchanged" means, stated exactly rather than approximately.
-    ///
-    /// The ceiling is a *device* pixel threshold, so at 2x it falls at 12
-    /// logical pixels. At or above that, forced `Mtsdf` renders bit-identically
-    /// to what it rendered before the compensation existed. Below it — 10 and 11
-    /// logical pixels, forced onto the field path against the engine's own
-    /// advice — a small bias does apply, and it is bounded here so the size of
-    /// the exception is on the record rather than assumed away.
-    ///
-    /// Under `TextRasterMode::Auto`, which is what every shipped widget uses,
-    /// there is no exception at all: the strategy threshold is the same number
-    /// as the ceiling, so no glyph the field path receives is ever below it.
-    /// `spherekit_text::raster` holds that test, where both constants are
-    /// visible at once.
-    #[test]
-    fn at_two_times_the_interface_type_scale_is_bit_identical() {
-        let ramp = |logical: f32| {
-            let em_px = logical * 2.0;
-            let px_range = em_px * (4.0 / 48.0);
-            (crate::scene::mtsdf_edge_ramp(em_px, px_range), px_range)
-        };
-        for logical in [12.0f32, 13.0, 14.0, 16.0, 20.0, 24.0] {
-            let ([scale, offset], px_range) = ramp(logical);
-            assert_eq!(offset, 0.0, "{logical} px at 2x was biased");
-            assert!((scale - px_range.max(1.0)).abs() < 1e-6, "{logical} px at 2x: scale {scale}");
-        }
-        // The bounded exception, in device pixels of edge movement.
-        for (logical, most) in [(10.0f32, 0.026f32), (11.0, 0.013)] {
-            let ([scale, offset], px_range) = ramp(logical);
-            let bias = offset / scale * px_range;
-            assert!(bias <= most, "{logical} px at 2x moved the edge by {bias}");
-        }
-    }
-
-    #[test]
-    fn every_glyph_in_a_run_is_shifted_by_the_same_amount() {
-        // The regression this exists for: rounding each quad's own top edge
-        // gives an `x` and an `l` different sub-pixel shifts, because their ink
-        // tops differ, and the shared baseline comes apart. The shift has to be
-        // derived from the pen, which every glyph in the run has in common.
-        let mut s = Scene::new(size2(px(800.0), px(600.0)), ScaleFactor::IDENTITY);
-        {
-            let mut c = Canvas::new(&mut s);
-            c.draw_glyph_run(
-                crate::scene::GlyphRun {
-                    font: FontId::new(0, 1),
-                    font_size: px(24.0),
-                    glyphs: smallvec::smallvec![
-                        crate::scene::PositionedGlyph {
-                            glyph: GlyphId(1),
-                            position: Point::new(px(10.0), px(40.31)),
-                        },
-                        crate::scene::PositionedGlyph {
-                            glyph: GlyphId(2),
-                            position: Point::new(px(30.0), px(40.31)),
-                        },
-                    ],
-                    raster: TextRasterMode::Auto,
-                    outline_width: Px::ZERO,
-                    outline_color: Color::TRANSPARENT,
-                    coverage_contrast: crate::scene::FULL_COVERAGE_CONTRAST,
-                },
-                Color::WHITE,
-            );
-        }
-        let mut c = BatchCompiler::new();
-        let f = c.compile(&s, &mut StubVariedGlyphs, &mut StubTextures(true));
-        assert_eq!(f.glyphs.len(), 2);
-
-        let pad = 0.1 * 24.0;
-        let shift = |g: &GlyphInstance, ink_top: f32| g.bounds[1] - (40.31 + ink_top * 24.0 - pad);
-        let a = shift(&f.glyphs[0], -0.517);
-        let b = shift(&f.glyphs[1], -0.733);
-        assert!((a - b).abs() < 1e-4, "glyphs shifted by {a} and {b}: the baseline is torn");
-    }
-
-    #[test]
-    fn a_field_quad_covers_the_padded_image_not_the_ink_box() {
-        // `generate_mtsdf` writes the ink box outset by the field's range on
-        // every side, and says outright that the caller must draw that box. A
-        // quad matching only the ink box squeezes the whole image into it, so
-        // the glyph renders at roughly 75 % of its size while its advance stays
-        // correct -- a line that is small and tracked out.
-        let s = glyph_run_at(10.0, 40.0, 24.0);
-        let mut c = BatchCompiler::new();
-        let f = c.compile(&s, &mut StubGlyphs { page: 0, calls: 0 }, &mut StubTextures(true));
-
-        // The stub reports a 0.6 x 0.8 em ink box with a 0.1 em range, at 24 px.
-        let g = &f.glyphs[0];
-        assert!((g.bounds[0] - (10.0 - 2.4)).abs() < 1e-4, "x {}", g.bounds[0]);
-        assert!((g.bounds[2] - 0.8 * 24.0).abs() < 1e-4, "width {}", g.bounds[2]);
-        assert!((g.bounds[3] - 1.0 * 24.0).abs() < 1e-4, "height {}", g.bounds[3]);
-    }
-
-    #[test]
-    fn a_bitmap_quad_is_not_padded_because_coverage_has_no_range() {
-        // The outset is unconditional, which is only correct because the bitmap
-        // path reports `range_em: 0`. If that ever changes, a bitmap stops being
-        // 1:1 with its texels and the snap above stops meaning anything.
+    fn a_glyph_quad_is_exactly_its_texel_count() {
+        // A coverage bitmap is only crisp at 1:1 with its texels; anything that
+        // pads or stretches the quad makes the snap above meaningless.
         let s = glyph_run_at(10.0, 40.0, 11.0);
         let mut c = BatchCompiler::new();
         let f = c.compile(&s, &mut StubBitmapGlyphs, &mut StubTextures(true));
@@ -2011,7 +1738,6 @@ mod tests {
         let g = &f.glyphs[0];
         assert_eq!(g.bounds[2], 4.0, "width must still equal the texel count");
         assert_eq!(g.bounds[3], 8.0, "height must still equal the texel count");
-        assert_eq!(g.px_range, 1e-3, "a bitmap carries no field range");
     }
 
     #[test]
@@ -2030,9 +1756,6 @@ mod tests {
                         glyph: GlyphId(1),
                         position: Point::new(px(10.3), px(20.7)),
                     }],
-                    raster: TextRasterMode::Auto,
-                    outline_width: Px::ZERO,
-                    outline_color: Color::TRANSPARENT,
                     coverage_contrast: crate::scene::FULL_COVERAGE_CONTRAST,
                 },
                 Color::WHITE,
@@ -2045,32 +1768,6 @@ mod tests {
             g.bounds[1].fract() != 0.0 || g.bounds[0].fract() != 0.0,
             "a rotated run must keep its exact geometry"
         );
-    }
-
-    #[test]
-    fn glyph_px_range_scales_with_font_size_and_dpi() {
-        let mut s = Scene::new(size2(px(800.0), px(600.0)), ScaleFactor::new(2.0));
-        {
-            let mut c = Canvas::new(&mut s);
-            c.draw_glyph_run(
-                crate::scene::GlyphRun {
-                    font: FontId::new(0, 1),
-                    font_size: px(20.0),
-                    glyphs: smallvec::smallvec![crate::scene::PositionedGlyph {
-                        glyph: GlyphId(1),
-                        position: Point::new(px(10.0), px(30.0)),
-                    }],
-                    raster: TextRasterMode::Mtsdf,
-                    outline_width: Px::ZERO,
-                    outline_color: Color::TRANSPARENT,
-                    coverage_contrast: crate::scene::FULL_COVERAGE_CONTRAST,
-                },
-                Color::WHITE,
-            );
-        }
-        let f = compile(&s);
-        // range_em 0.1 * size 20 * scale 2 = 4 destination pixels.
-        assert!((f.glyphs[0].px_range - 4.0).abs() < 1e-4, "{}", f.glyphs[0].px_range);
     }
 
     #[test]
@@ -2160,6 +1857,24 @@ mod tests {
         let idx: Vec<u32> = f.quads.iter().map(|q| q.gradient).collect();
         assert!(idx.iter().all(|i| *i != u32::MAX));
         assert_eq!(idx.len(), idx.iter().collect::<std::collections::HashSet<_>>().len());
+    }
+
+    #[test]
+    fn a_gradient_paint_carries_its_opacity_into_every_stop() {
+        let mut s = scene();
+        {
+            let mut c = Canvas::new(&mut s);
+            let g = spherekit_core::Gradient::vertical(px(10.0), Color::RED, Color::BLUE);
+            // Inherited opacity is how a widget fades: it lands on the paint.
+            c.set_opacity(0.5);
+            c.fill_rect_with(rect(px(0.0), px(0.0), px(10.0), px(10.0)), Brush::Gradient(g));
+        }
+        let f = compile(&s);
+        let gpu = f.gradients[0];
+        let red = Color::RED.to_linear().to_array();
+        for (got, want) in gpu.colors[0].iter().zip(red) {
+            assert!((got - want * 0.5).abs() < 1e-6, "{:?}", gpu.colors[0]);
+        }
     }
 
     #[test]

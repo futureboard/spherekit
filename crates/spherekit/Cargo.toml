@@ -14,9 +14,8 @@ categories = ["graphics", "gui", "rendering"]
 default = []
 # Compiles the in-process V8 host and re-exports it as `spherekit::js`.
 #
-# Off by default because the V8 monolith is a ~100 MB Windows x86_64 prebuilt
-# that `spherekit-jsengine`'s build script downloads, and CI builds this crate
-# on Linux and macOS where it does not exist. Everything else in the facade —
+# Off by default because rusty_v8 (the `v8` crate) downloads a ~230 MB
+# prebuilt static V8 on first build. Everything else in the facade —
 # including the React host and the
 # JSON Lines bridge that a WebView or child-process transport drives — works
 # without it, so no one pays for a JavaScript engine they never start.
@@ -25,7 +24,8 @@ v8 = ["dep:spherekit-jsengine", "spherekit-bridge/v8"]
 [dependencies]
 spherekit-core.workspace = true
 spherekit-render.workspace = true
-spherekit-wgpu.workspace = true
+spherekit-d3d11.workspace = true
+spherekit-skia.workspace = true
 spherekit-text.workspace = true
 spherekit-layout.workspace = true
 spherekit-svg.workspace = true
@@ -41,3 +41,7 @@ rustc-hash.workspace = true
 raw-window-handle.workspace = true
 tracing.workspace = true
 pollster.workspace = true
+
+[dev-dependencies]
+# PNG output for the `screenshot` example.
+image.workspace = true

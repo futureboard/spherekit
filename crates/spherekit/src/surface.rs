@@ -1,7 +1,7 @@
 //! A rendered window surface: everything wired together.
 //!
 //! Each subsystem is independently usable, and this is what it looks like when
-//! they are all used at once. A [`SphereKitSurface`] owns the GPU backend, the UI
+//! they are all used at once. A [`SphereKitSurface`] owns the renderer, the UI
 //! tree, the text system, the image cache and the batch compiler for one
 //! window, and turns "here is my root element" into a presented frame.
 //!
@@ -17,8 +17,18 @@
 //! ```
 //!
 //! Nothing here is mandatory. An application that wants its own frame loop can
-//! drive [`spherekit_ui::UiTree`] and [`spherekit_wgpu::WgpuRenderer`] directly; this
-//! type exists so that the common case is short.
+//! drive [`spherekit_ui::UiTree`] and a renderer —
+//! [`spherekit_d3d11::D3D11Renderer`] or [`spherekit_skia::SkiaRenderer`] —
+//! directly; this type exists so that the common case is short.
+//!
+//! ## Choosing a renderer
+//!
+//! [`Backend::Auto`] renders through Direct3D 11 on Windows and falls back to
+//! Skia on the CPU when no hardware Direct3D 11 device can be created — a
+//! remote session without GPU access, a broken driver, a locked-down VM. Off
+//! Windows, Skia is the only backend. `SPHEREKIT_BACKEND=d3d11` or `=skia`
+//! overrides the application's choice, so a diagnostic run never needs a
+//! rebuild.
 
 use rustc_hash::FxHashMap;
 use spherekit_core::{
@@ -31,8 +41,41 @@ use spherekit_render::{
 };
 use spherekit_text::{GlyphFormat, TextSystem};
 use spherekit_ui::{AnyElement, DispatchResult, Theme, UiEvent, UiTree};
-use spherekit_wgpu::{Backend, WgpuRenderer};
 use std::sync::Arc;
+
+/// Which renderer a surface draws through.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Backend {
+    /// Direct3D 11 where it works, Skia on the CPU otherwise.
+    #[default]
+    Auto,
+    /// Direct3D 11, presented through DirectComposition. Windows only;
+    /// requesting it elsewhere, or on a machine with no hardware device, fails
+    /// surface creation rather than silently falling back.
+    D3D11,
+    /// Skia's CPU rasteriser, presented with a software blit. Works everywhere,
+    /// needs no GPU, and is the only backend off Windows.
+    Skia,
+}
+
+impl Backend {
+    /// Reads `SPHEREKIT_BACKEND`, if it names a backend.
+    ///
+    /// Unrecognised values are reported and ignored rather than failing: a typo
+    /// in a diagnostic variable should not stop an application starting.
+    pub fn from_env() -> Option<Self> {
+        let value = std::env::var("SPHEREKIT_BACKEND").ok()?;
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "auto" => Some(Backend::Auto),
+            "d3d11" | "d3d" | "dx11" | "gpu" => Some(Backend::D3D11),
+            "skia" | "cpu" | "software" => Some(Backend::Skia),
+            other => {
+                tracing::warn!(target: "spherekit", "ignoring unknown SPHEREKIT_BACKEND={other:?}");
+                None
+            }
+        }
+    }
+}
 
 /// How a surface should be created.
 #[derive(Copy, Clone, Debug)]
@@ -66,15 +109,12 @@ pub struct SurfaceOptions {
     /// Scanning the system font directory takes a noticeable fraction of a
     /// second, so a plug-in that ships its own font should turn this off.
     pub load_system_fonts: bool,
-    /// Which graphics API to render through.
+    /// Which renderer to draw through.
     ///
-    /// [`Backend::Auto`] lets wgpu decide, which is right for almost every
-    /// application. Naming one is for the cases where the choice is not the
-    /// renderer's to make: a Windows tool that has to be capturable by a
-    /// D3D-only debugger, a host application that already owns a device on a
-    /// particular API, or a machine whose driver is only trustworthy on one of
-    /// them. `WGPU_BACKEND` overrides this, so a diagnostic run never has to
-    /// rebuild.
+    /// [`Backend::Auto`] is right for almost every application. Forcing
+    /// [`Backend::Skia`] is for hosts where the GPU is off limits — a plug-in
+    /// inside a DAW whose own renderer owns the device, say. `SPHEREKIT_BACKEND`
+    /// overrides this, so a diagnostic run never has to rebuild.
     pub backend: Backend,
 }
 
@@ -96,7 +136,7 @@ impl Default for SurfaceOptions {
 /// Per-frame counters, for the diagnostics overlay.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub struct SurfaceStats {
-    /// What the GPU backend reported.
+    /// What the renderer reported.
     pub frame: FrameStats,
     /// What the UI tree reported.
     pub tree: spherekit_ui::TreeStats,
@@ -121,7 +161,8 @@ pub struct SurfaceStats {
 /// things and only one of them is avoidable.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub struct InitTiming {
-    /// Adapter selection, device creation and the first surface configuration.
+    /// Renderer start-up: device creation, shader compilation and the first
+    /// surface configuration — or, for Skia, the software surface.
     pub gpu_ms: f32,
     /// Scanning and indexing the platform's fonts.
     ///
@@ -155,7 +196,12 @@ impl TextureProvider for ImageTextures<'_> {
 
 /// One window's worth of SphereKit.
 pub struct SphereKitSurface {
-    renderer: WgpuRenderer,
+    renderer: Box<dyn RendererBackend>,
+    /// The backend actually in use, after `Auto` and the environment resolved.
+    backend: Backend,
+    /// What the surface was created with, re-applied on every resize so a
+    /// transparent window stays transparent.
+    options: SurfaceOptions,
     compiler: BatchCompiler,
     scene: Scene,
     text: TextSystem,
@@ -163,8 +209,6 @@ pub struct SphereKitSurface {
     tree: UiTree,
     size: Size<DevicePx>,
     scale_factor: ScaleFactor,
-    /// Multisample count requested at construction.
-    msaa_samples: u32,
     /// GPU texture for each glyph atlas page.
     atlas_textures: FxHashMap<u32, TextureId>,
     /// The atlas generation the textures were built against. A bump means every
@@ -195,6 +239,9 @@ impl SphereKitSurface {
     ///
     /// `window` must implement the `raw-window-handle` traits and outlive the
     /// surface; an [`Arc`] is the usual way to guarantee both.
+    ///
+    /// Async for API stability: neither renderer awaits anything today, so
+    /// `pollster::block_on` returns immediately.
     pub async fn new<W>(
         window: Arc<W>,
         size: Size<DevicePx>,
@@ -202,25 +249,80 @@ impl SphereKitSurface {
         options: SurfaceOptions,
     ) -> Result<Self, InitError>
     where
-        W: spherekit_wgpu::wgpu::WasmNotSendSync
-            + raw_window_handle::HasWindowHandle
+        W: raw_window_handle::HasWindowHandle
             + raw_window_handle::HasDisplayHandle
+            + Send
+            + Sync
             + 'static,
     {
         let gpu_start = std::time::Instant::now();
-        let renderer = WgpuRenderer::new(
-            window,
+        let config = SurfaceConfig {
             size,
             scale_factor,
-            options.present,
-            options.vsync,
-            options.transparent,
-            options.msaa_samples,
-            options.backend,
-        )
-        .await?;
+            present: options.present,
+            vsync: options.vsync,
+            transparent: options.transparent,
+            msaa_samples: options.msaa_samples,
+        };
+        let requested = Backend::from_env().unwrap_or(options.backend);
+        let (renderer, backend) = create_renderer(window, config, requested)?;
         let gpu_ms = gpu_start.elapsed().as_secs_f32() * 1000.0;
+        Ok(Self::with_renderer(renderer, backend, gpu_ms, size, scale_factor, options))
+    }
 
+    /// Creates a surface with no window, rendering into an offscreen image.
+    ///
+    /// For screenshots, golden-image tests and server-side rendering. Read the
+    /// result back with [`SphereKitSurface::read_pixels`] after
+    /// [`SphereKitSurface::render`]. [`Backend::Auto`] prefers Direct3D 11 —
+    /// on a machine without a GPU, its WARP software device — and falls back
+    /// to Skia; off Windows it is Skia.
+    pub fn new_offscreen(
+        size: Size<DevicePx>,
+        scale_factor: ScaleFactor,
+        options: SurfaceOptions,
+    ) -> Result<Self, InitError> {
+        let gpu_start = std::time::Instant::now();
+        let config = SurfaceConfig {
+            size,
+            scale_factor,
+            present: options.present,
+            vsync: options.vsync,
+            transparent: options.transparent,
+            msaa_samples: options.msaa_samples,
+        };
+        let skia = || -> Result<(Box<dyn RendererBackend>, Backend), InitError> {
+            Ok((Box::new(spherekit_skia::SkiaRenderer::new_offscreen(config)?), Backend::Skia))
+        };
+        let d3d11 = || -> Result<(Box<dyn RendererBackend>, Backend), InitError> {
+            Ok((Box::new(spherekit_d3d11::D3D11Renderer::new_offscreen(config)?), Backend::D3D11))
+        };
+        let (renderer, backend) = match Backend::from_env().unwrap_or(options.backend) {
+            Backend::Skia => skia()?,
+            Backend::D3D11 => d3d11()?,
+            Backend::Auto => d3d11().or_else(|_| skia())?,
+        };
+        let gpu_ms = gpu_start.elapsed().as_secs_f32() * 1000.0;
+        Ok(Self::with_renderer(renderer, backend, gpu_ms, size, scale_factor, options))
+    }
+
+    /// The last rendered frame as RGBA8 rows, sRGB-encoded and premultiplied.
+    ///
+    /// Always available on an offscreen surface. A window's back buffer is
+    /// undefined once presented, so on a windowed surface this reports an error.
+    pub fn read_pixels(&mut self) -> Result<Vec<u8>, RenderError> {
+        self.renderer.read_pixels()
+    }
+
+    /// Everything after the renderer exists, shared by both constructors.
+    fn with_renderer(
+        renderer: Box<dyn RendererBackend>,
+        backend: Backend,
+        gpu_ms: f32,
+        size: Size<DevicePx>,
+        scale_factor: ScaleFactor,
+        options: SurfaceOptions,
+    ) -> Self {
         let fonts_start = std::time::Instant::now();
         let mut text = if options.load_system_fonts {
             TextSystem::with_system_fonts()
@@ -228,7 +330,7 @@ impl SphereKitSurface {
             TextSystem::new()
         };
         let fonts_ms = fonts_start.elapsed().as_secs_f32() * 1000.0;
-        // The atlas must not be configured larger than the adapter can hold, or
+        // The atlas must not be configured larger than the device can hold, or
         // the failure appears at upload time rather than at allocation time.
         text.set_max_texture_size(renderer.capabilities().max_texture_size);
 
@@ -246,8 +348,10 @@ impl SphereKitSurface {
         let viewport =
             Size::new(scale_factor.to_logical(size.width), scale_factor.to_logical(size.height));
 
-        Ok(Self {
+        Self {
             renderer,
+            backend,
+            options,
             compiler,
             scene: Scene::new(viewport, scale_factor),
             text,
@@ -255,7 +359,6 @@ impl SphereKitSurface {
             tree: UiTree::new(),
             size,
             scale_factor,
-            msaa_samples: options.msaa_samples,
             atlas_textures: FxHashMap::default(),
             atlas_generation: 0,
             expand_scratch: Vec::new(),
@@ -265,13 +368,21 @@ impl SphereKitSurface {
             last_frame: std::time::Instant::now(),
             init_timing: InitTiming { gpu_ms, fonts_ms },
             presented: false,
-        })
+        }
     }
 
-    /// The adapter this surface is running on, for diagnostics.
+    /// The renderer this surface is running on, for diagnostics: the adapter
+    /// for Direct3D 11, or the Skia version for the CPU path.
     #[inline]
     pub fn adapter_name(&self) -> &str {
         self.renderer.adapter_name()
+    }
+
+    /// The backend actually in use, after [`Backend::Auto`], any fallback and
+    /// `SPHEREKIT_BACKEND` were resolved.
+    #[inline]
+    pub fn backend(&self) -> Backend {
+        self.backend
     }
 
     /// Where start-up time went.
@@ -391,10 +502,10 @@ impl SphereKitSurface {
         self.renderer.configure_surface(SurfaceConfig {
             size,
             scale_factor,
-            present: PresentPreference::LowLatency,
-            vsync: VsyncMode::On,
-            transparent: false,
-            msaa_samples: self.msaa_samples,
+            present: self.options.present,
+            vsync: self.options.vsync,
+            transparent: self.options.transparent,
+            msaa_samples: self.options.msaa_samples,
         })
     }
 
@@ -517,7 +628,7 @@ impl SphereKitSurface {
                 let blank = vec![0u8; (page_size as usize) * (page_size as usize) * 4];
                 let id = self.renderer.upload_texture(None, page_size, page_size, &blank)?;
                 self.atlas_textures.insert(*page, id);
-                self.renderer.textures_mut().set_atlas_page(*page, id);
+                self.renderer.set_atlas_page(*page, id);
             }
         }
 
@@ -544,7 +655,7 @@ impl SphereKitSurface {
             // rare — it only holds the sub-12-pixel fallback — so the 4x memory
             // costs far less than a second pipeline variant would.
             let rgba: &[u8] = match format {
-                GlyphFormat::Mtsdf | GlyphFormat::ColorBitmap => &data,
+                GlyphFormat::ColorBitmap => &data,
                 GlyphFormat::Grayscale => {
                     self.expand_scratch.clear();
                     self.expand_scratch.reserve((width as usize) * (height as usize) * 4);
@@ -615,6 +726,50 @@ impl SphereKitSurface {
     }
 }
 
+/// Creates the renderer for `requested`, resolving [`Backend::Auto`].
+fn create_renderer<W>(
+    window: Arc<W>,
+    config: SurfaceConfig,
+    requested: Backend,
+) -> Result<(Box<dyn RendererBackend>, Backend), InitError>
+where
+    W: raw_window_handle::HasWindowHandle
+        + raw_window_handle::HasDisplayHandle
+        + Send
+        + Sync
+        + 'static,
+{
+    let skia = |window: Arc<W>| -> Result<(Box<dyn RendererBackend>, Backend), InitError> {
+        let renderer = spherekit_skia::SkiaRenderer::new(window, config)?;
+        Ok((Box::new(renderer), Backend::Skia))
+    };
+    match requested {
+        Backend::Skia => skia(window),
+        Backend::D3D11 => {
+            let renderer = spherekit_d3d11::D3D11Renderer::new(&*window, config)?;
+            Ok((Box::new(renderer), Backend::D3D11))
+        }
+        Backend::Auto => {
+            if !cfg!(windows) {
+                return skia(window);
+            }
+            match spherekit_d3d11::D3D11Renderer::new(&*window, config) {
+                Ok(renderer) => Ok((Box::new(renderer), Backend::D3D11)),
+                Err(error) => {
+                    // Not an error: this is what the fallback is for. Logged at
+                    // warn because a machine that *should* have a GPU and lands
+                    // here is worth noticing.
+                    tracing::warn!(
+                        target: "spherekit",
+                        "Direct3D 11 unavailable ({error}); rendering with Skia on the CPU"
+                    );
+                    skia(window)
+                }
+            }
+        }
+    }
+}
+
 /// Expands compact RGB LCD coverage into the RGBA8 atlas texture layout.
 fn expand_subpixel_region(
     data: &[u8],
@@ -663,6 +818,24 @@ mod tests {
         assert_eq!(o.present.max_frame_latency(), 1);
         assert!(o.load_system_fonts);
         assert!(o.rgb_subpixel_text, "opaque desktop surfaces should render RGB text by default");
+    }
+
+    #[test]
+    fn backend_names_parse_from_the_environment_spelling() {
+        // `from_env` reads the process environment, which tests share, so the
+        // parsing is checked through a scoped variable on a private name.
+        let parse = |v: &str| {
+            // SAFETY: test-only, and no other test reads this variable.
+            unsafe { std::env::set_var("SPHEREKIT_BACKEND", v) };
+            let b = Backend::from_env();
+            unsafe { std::env::remove_var("SPHEREKIT_BACKEND") };
+            b
+        };
+        assert_eq!(parse("skia"), Some(Backend::Skia));
+        assert_eq!(parse(" CPU "), Some(Backend::Skia));
+        assert_eq!(parse("d3d11"), Some(Backend::D3D11));
+        assert_eq!(parse("auto"), Some(Backend::Auto));
+        assert_eq!(parse("vulkan"), None);
     }
 
     #[test]

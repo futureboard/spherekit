@@ -21,12 +21,11 @@
 //! into visible clumps. Vertical fitting changes no advance at all, because it
 //! only ever moves y.
 //!
-//! ## Why only below the bitmap threshold
+//! ## Where it applies
 //!
-//! A distance field is size-independent by construction: one field serves every
-//! size, so there is no single size to fit it to. Fitting is therefore a
-//! property of the bitmap path, which rasterises at one exact device size, and
-//! it is applied there and nowhere else.
+//! Fitting needs one exact device size, which every glyph has: the atlas holds
+//! a bitmap per size. It is used by the outline rasteriser only. DirectWrite
+//! applies its own `gasp`-driven vertical fitting and receives no help here.
 
 use smallvec::SmallVec;
 
@@ -237,11 +236,10 @@ fn collapse_knot(
     // displacement at one whole device pixel, half from the line's own rounding
     // and half from the overshoot, rather than at some measured number.
     //
-    // The upper gate is reachable and must stay. `TextRasterMode::Bitmap`
-    // forces this path at any size, and `bitmap_size_px` clamps at `u16::MAX`,
-    // not at `BITMAP_MAX_DEVICE_PX`; Georgia's 0.0166 em crosses half a pixel
-    // at about 30 device px. It simply never fires under `Auto`, where 24 px is
-    // the ceiling and the largest measured overshoot is 0.40 px there.
+    // The upper gate is reachable and must stay. Every size is rasterised as a
+    // bitmap and `bitmap_size_px` clamps only at `u16::MAX`; Georgia's 0.0166 em
+    // crosses half a pixel at about 30 device px, and from there on suppressing
+    // the overshoot would visibly flatten round letters.
     if !(1.0 / 64.0..0.5).contains(&over_px) {
         return None;
     }
@@ -744,7 +742,7 @@ mod face_tests {
         for size in [11.0f32, 12.0, 13.0, 14.0, 15.0, 16.0] {
             let Some((fitted, plain)) = db
                 .with_face(font, |face| {
-                    let shape = crate::mtsdf::extract_shape(face, glyph).ok()?;
+                    let shape = crate::outline::extract_shape(face, glyph).ok()?;
                     let zones = VerticalZones::from_face(face)?;
                     GridFit::new(&zones, size)?;
                     let fitted = rasterize_glyph(face, glyph, size).ok()?;
@@ -823,7 +821,7 @@ mod face_tests {
             .with_face(font, |face| {
                 let zones = VerticalZones::from_face(face)?;
                 let fit = GridFit::new(&zones, 13.0)?;
-                let shape = crate::mtsdf::extract_shape(face, glyph).ok()?;
+                let shape = crate::outline::extract_shape(face, glyph).ok()?;
                 let ink = shape.bounds()?;
                 // `x` sits on the baseline, so its lowest point is at or very near
                 // zero and the fit must leave it there.
@@ -842,7 +840,7 @@ mod face_tests {
 #[cfg(test)]
 mod overshoot_measurement {
     use crate::font::FontDatabase;
-    use crate::mtsdf::extract_shape;
+    use crate::outline::extract_shape;
     use crate::types::FontRequest;
 
     /// Measures how far the round letters actually overshoot, per face.

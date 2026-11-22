@@ -1,12 +1,11 @@
 # JavaScript
 
-`spherekit-jsengine` embeds V8 directly. There is no browser, no WebView and no Node — an isolate
+`spherekit-jsengine` embeds V8 directly, through [`v8`](https://crates.io/crates/v8) (rusty_v8). There is no browser, no WebView and no Node — an isolate
 runs on the UI thread, in the renderer's own address space, and the host decides exactly when
 JavaScript is allowed to run.
 
-> **Windows x86_64 only today.** The prebuilt monolith `build.rs` fetches is a Windows build; on
-> every other target the crate compiles to a stub whose every method returns
-> `Error::UnsupportedPlatform`. See [Porting](#porting) at the end.
+> V8 is linked statically from rusty_v8's prebuilt libraries, which exist for Windows, Linux and
+> macOS on x86_64 and aarch64. See [The V8 prebuilt](#the-v8-prebuilt).
 
 ## Why the Rust surface owns an `Engine`
 
@@ -22,38 +21,27 @@ and nothing pretends the isolate is shareable.
 **Local handles are stack-scoped.** A `v8::Local<T>` is only valid inside the `HandleScope` that
 created it, which is a C++ stack frame. Rust's lifetimes can model that — several crates do — but
 the modelling has to be exactly right or the result is a dangling handle with no diagnostic. The
-alternative taken here is to never let a handle out: the native shim opens its scopes, does the
-work, and returns *owned* UTF-8 to Rust before the scope closes. The unsafe surface is then a fixed
-handful of pointer copies rather than a lifetime puzzle.
+alternative taken here is to never let a handle out: every `Engine` method opens its own scopes, does the
+work, and returns *owned* UTF-8 before the scope closes. rusty_v8's pinned scopes keep the handles
+honest inside the crate; callers never see one.
 
 **So the API is string-in, string-out.** `Engine::bind` and `Engine::call_global` both speak `&str`,
 not a `serde` value and not a `v8::Value`. That is not a placeholder for something richer. Anything
-richer forces a shared value model across the FFI boundary, and every host that embeds this crate
+richer forces a shared value model on every host, and every host that embeds this crate
 already has one — `spherekit-bridge` sends JSON Lines. Keeping the boundary at "one owned UTF-8
-buffer each way" means the marshaller does not grow a case for every new type.
+string each way" means the marshaller does not grow a case for every new type.
 
-## The shim's ownership rules
+## Host function ownership
 
-`src/v8_shim.cc` is compiled by `build.rs` and linked against `v8_monolith.lib`. Three rules govern
-every buffer that crosses:
-
-1. **A result buffer comes from `spherekit_v8_alloc` and belongs to Rust.** Rust copies it out and
-   releases it with `spherekit_v8_free_buffer`. That is what `take_result` and `take_string` do, and
-   it is why an error path frees three buffers (message, stack, resource) rather than one.
-2. **An error struct is passed in zeroed.** On success its pointers stay null and nothing needs
-   freeing; on a non-zero status they are live and Rust owns them.
-3. **A bound closure's buffers belong to the shim.** The `HostCallback` thunk fills `result` *or*
-   `error` from `spherekit_v8_alloc`, and the shim frees whichever was produced after reading it.
-
-Bound closures themselves are owned by `Engine`, not by the shim. Each is double-boxed: the outer
+Bound closures are owned by `Engine`, not by V8. Each is double-boxed: the outer
 box gives the record an address that stays put once V8 has captured it in a `v8::External`, and the
-inner box erases the closure's type so one `extern "C"` thunk serves every binding. `Drop` disposes
-the isolate **first** and reclaims the boxes afterwards — once the isolate is gone no script can be
+inner box erases the closure's type so one V8 callback serves every binding. Field order makes drop
+dispose the isolate **first** and reclaims the boxes afterwards — once the isolate is gone no script can be
 running, which is what makes freeing the handlers safe.
 
-A panic must not unwind into C++, so the thunk runs the closure inside `catch_unwind` and reports a
+A panic must not unwind into V8, so the callback runs the closure inside `catch_unwind` and reports a
 panic to JavaScript as a thrown `Error`. Under `panic = "abort"` that is dead weight; under the test
-profile it is the difference between a failing assertion and undefined behaviour.
+profile it is the difference between a failing assertion and an abort.
 
 ## `bind` and `call_global`
 
@@ -238,33 +226,31 @@ cargo run -p reactdemo --release
 
 ## The V8 prebuilt
 
-`build.rs` downloads a prebuilt monolith on first build (≈100 MB) into `crates/spherekit-jsengine/v8backend`,
-under a lock file so two concurrent Cargo processes cannot fight over the extraction, and verifies
-four files are present before compiling anything. `SPHEREKIT_V8_URL` overrides the source.
+The `v8` crate's build script downloads a prebuilt static library for the target on first build
+(`rusty_v8_release_<target>.lib.gz`, ≈230 MB unpacked on Windows) from the
+[denoland/rusty_v8 releases](https://github.com/denoland/rusty_v8/releases) into
+`target/<profile>/gn_out/obj`. Nothing is compiled from C++ and no LLVM, Python or GN is needed.
 
-The compile defines must match what the prebuilt was built with — `V8_COMPRESS_POINTERS` on, sandbox
-off — because `V8::Initialize` checks the embedder configuration at runtime and a mismatch fails
-there rather than at link time. `icudtl.dat` is located through a `SPHEREKIT_V8_ICU_DATA_PATH`
-environment variable baked in by the build script, so `Engine::new()` needs no path from the caller;
-`Engine::with_icu_data_path` exists for an embedder shipping its own.
+To build offline or behind a proxy, use rusty_v8's own variables:
 
-The static monolith carries dependencies on eleven Windows system libraries, emitted by `build.rs` so
-consumers do not have to duplicate V8's platform link contract.
+| Variable | Effect |
+|---|---|
+| `RUSTY_V8_ARCHIVE` | Path or URL of the `.lib`/`.a` (optionally `.gz`) to use instead of downloading |
+| `RUSTY_V8_MIRROR` | Base URL to download from instead of GitHub |
+| `RUSTY_V8_ARCHIVE_SHA256` | Pin the archive's checksum |
 
-## Porting
+A pre-seeded `$CARGO_HOME/.rusty_v8/` cache is also honoured.
 
-Nothing in the Rust or C++ source is Windows-specific: the shim is portable C++20 against the public
-V8 API, and the `#[cfg(windows)]` gates exist because the *prebuilt* does not exist elsewhere. What a
-second target needs:
+V8 is linked straight into the executable: there is no DLL and no `icudtl.dat` to ship. ICU 78 data
+comes from the `deno_core_icudata` crate and is embedded, so `Intl` works out of the box;
+`Engine::with_icu_data_path` loads a different ICU 78 `icudtl.dat` instead (process-wide, first
+engine wins).
 
-1. A V8 monolith for it, built with the same pointer-compression and sandbox configuration, published
-   where `build.rs` can fetch it.
-2. `build.rs` extended past its `target_os != "windows"` early return, with the right archive name and
-   the platform's link libraries in place of the Windows list.
-3. The `#[cfg(windows)]` gates in `src/lib.rs` widened to the supported set. The stub `Engine` is a
-   complete mirror of the real API for exactly this reason — a host crate is written once and fails
-   at runtime on an unsupported target rather than failing to build there.
+The prebuilt is built against the dynamic MSVC runtime (`/MD`) with its own namespaced libc++, so
+it links alongside the Skia prebuilt without the duplicate-symbol clash the old `v8_monolith.lib`
+had. The linker still prints a harmless `LNK4098: defaultlib 'libcmt.lib' conflicts` warning.
 
-Until then, `spherekit`'s `v8` feature stays off by default, `spherekit-bridge` compiles without a
-JavaScript engine at all, and an application that wants React on another platform drives the same
-[API bridge](api-bridge.md) from a WebView or a child process.
+The version in use is whatever `v8` resolves to in `Cargo.lock`; `Engine::version()` reports it
+(`15.2.x-rusty` at the time of writing). Upgrading V8 is a `v8` version bump in
+`crates/spherekit-jsengine/Cargo.toml`, plus the matching `deno_core_icudata` when ICU's major
+version moves.

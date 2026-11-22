@@ -2,11 +2,12 @@
 //!
 //! This is the milestone the architecture exists to reach. In one window:
 //!
-//! * a native window with a wgpu surface, correct resize and correct DPI
+//! * a native window with a Direct3D 11 (or Skia) surface, correct resize and
+//!   correct DPI
 //! * ten thousand instanced rectangles in a stress panel
 //! * rounded rectangles, borders, shadows and gradients
 //! * clipping and a scrolled, culled list
-//! * MTSDF text, including Thai, Japanese, Chinese and Arabic
+//! * native-looking text, including Thai, Japanese, Chinese and Arabic
 //! * a retained layout tree that reuses every node across rebuilds
 //! * an interactive button and a draggable knob
 //! * VU meters driven from a simulated audio thread through a lock-free
@@ -36,7 +37,7 @@ use spherekit::core::{Color, Corners, DevicePx, Px, RoundedRect, Size, px, rect,
 use spherekit::platform::{
     App, AppContext, AppHandler, RedrawPolicy, WindowAttributes, WindowEvent, WindowId,
 };
-use spherekit::render::{Canvas, TextRasterMode};
+use spherekit::render::Canvas;
 use spherekit::ui::{
     AnyElement, ButtonVariant, Element, EventFlow, InputTranslator, IntoElement, PaintContext,
     ParentElement, Role, Semantics, Styled, Theme, ValueRange, button, div, knob, label,
@@ -241,7 +242,7 @@ impl Demo {
                     .no_wrap(),
             )
             .child(div().flex_1())
-            // Multilingual text, all through the same MTSDF path. If any of
+            // Multilingual text, all through the same glyph path. If any of
             // these render as boxes, font fallback is broken.
             .child(
                 label("ไทย  日本語  中文  한국어  العربية")
@@ -769,7 +770,6 @@ fn _type_witnesses(
     _: &mut PaintContext<'_, '_>,
     _: &mut Canvas<'_>,
     _: EventFlow,
-    _: TextRasterMode,
     _: RedrawPolicy,
     _: RoundedRect,
     _: Corners<Px>,

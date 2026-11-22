@@ -957,7 +957,7 @@ mod tests {
     use crate::types::{FontRequest, FontWeight};
 
     fn gkey(n: u16) -> GlyphKey {
-        GlyphKey::mtsdf(FontId::new(0, 1), GlyphId(n), 0)
+        GlyphKey::bitmap(FontId::new(0, 1), GlyphId(n), 0, 16)
     }
 
     fn placement(page: u32) -> AtlasPlacement {
@@ -966,8 +966,7 @@ mod tests {
             uv: [0.0, 0.0, 0.1, 0.1],
             texels: rect(0, 0, 8, 8),
             bounds_em: rect(0.0, -0.7, 0.5, 0.7),
-            range_em: 0.05,
-            format: crate::types::GlyphFormat::Mtsdf,
+            format: crate::types::GlyphFormat::ColorBitmap,
         }
     }
 

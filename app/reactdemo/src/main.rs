@@ -1,11 +1,28 @@
-//! # SphereKit React demo
+//! # SphereKit Studio — the React demo
 //!
 //! React 19 running inside SphereKit's own V8 isolate, styled by the shared
-//! CSS runtime, rendered on the GPU. No browser, no WebView, no Node.
+//! CSS runtime, rendered natively through Direct3D 11 — or Skia on the CPU
+//! when there is no GPU. No browser, no WebView, no Node.
+//!
+//! The app (`renderer/src`) has four pages: a mixer whose meters are driven by
+//! a native event, a task list with a controlled text field, a searchable
+//! multilingual roster, and an About page that asks the host what it is
+//! running on.
 //!
 //! ```text
 //! cargo run -p reactdemo --release
+//! SPHEREKIT_BACKEND=skia cargo run -p reactdemo --release
 //! ```
+//!
+//! ## The bridge, both ways
+//!
+//! | Direction | Name | What it does |
+//! |---|---|---|
+//! | JS -> native | `app.info` | backend, adapter, V8 version, scale, start-up time |
+//! | JS -> native | `app.setAnimating` | the mixer asks for a continuous redraw loop |
+//! | JS -> native | `app.quit` | ends the event loop |
+//! | native -> JS | `frame` | every presented frame: count, fps, CPU ms |
+//! | native -> JS | `meters` | per-channel levels, only while animating |
 //!
 //! ## What is actually happening
 //!
@@ -25,7 +42,7 @@
 //!                                        |         spherekit-ui elements
 //!                                        |              |
 //!                                        |              v
-//!                                        |         layout -> paint -> wgpu
+//!                                        |         layout -> paint -> d3d11|skia
 //!                                        |
 //!   __spherekitReceive(frame)  <---------+  native events, by node id
 //! ```
@@ -44,7 +61,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
@@ -73,11 +90,107 @@ const RENDERER: &str = include_str!(concat!(env!("OUT_DIR"), "/app.js"));
 /// Which renderer `build.rs` managed to produce.
 const RENDERER_KIND: &str = env!("SPHEREKIT_REACTDEMO_BUNDLE");
 
+/// The window background, matching `--bg` in the stylesheet so a resize never
+/// flashes a different colour before the first commit lands.
+const BACKGROUND: Color = Color::hex(0x1B1C1F);
+
 fn main() {
+    // `--screenshot out.png [--page tasks] [--scale 2]` renders one page with
+    // no window and exits: the whole React -> V8 -> bridge -> layout -> renderer
+    // path, read back from an offscreen surface.
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(at) = args.iter().position(|a| a == "--screenshot") {
+        let value =
+            |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned();
+        let out = args.get(at + 1).cloned().unwrap_or_else(|| "reactdemo.png".into());
+        let page = value("--page").unwrap_or_else(|| "mixer".into());
+        let scale = value("--scale").and_then(|s| s.parse().ok()).unwrap_or(1.0);
+        if let Err(error) = screenshot(&out, &page, scale) {
+            eprintln!("screenshot failed: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if let Err(error) = App::new(ReactDemo::new()).run() {
         eprintln!("event loop failed: {error}");
         std::process::exit(1);
     }
+}
+
+/// Renders one page offscreen and writes it to `out` as a PNG.
+fn screenshot(out: &str, page: &str, scale: f32) -> Result<(), String> {
+    let scale = spherekit::core::ScaleFactor::new(scale);
+    let logical = size(px(980.0), px(680.0));
+    let physical = spherekit::core::Size::new(
+        spherekit::core::DevicePx((logical.width.get() * scale.get()).round() as i32),
+        spherekit::core::DevicePx((logical.height.get() * scale.get()).round() as i32),
+    );
+    let mut demo = ReactDemo::new();
+    let mut surface = SphereKitSurface::new_offscreen(physical, scale, SurfaceOptions::default())
+        .map_err(|e| format!("surface: {e}"))?;
+    surface.set_theme(Theme::dark());
+    let timing = surface.init_timing();
+    *demo.info.borrow_mut() = serde_json::json!({
+        "backend": format!("{:?}", surface.backend()),
+        "adapter": surface.adapter_name(),
+        "v8": spherekit_bridge::v8_version(),
+        "renderer": RENDERER_KIND,
+        "scale": scale.get(),
+        "initMs": timing.total_ms(),
+    });
+    println!("backend: {:?} — {}", surface.backend(), surface.adapter_name());
+    demo.surface = Some(surface);
+    demo.start_javascript();
+    if let Some(error) = demo.js_error.as_ref() {
+        return Err(format!("javascript: {error}"));
+    }
+    if let Some(js) = demo.js.as_mut() {
+        js.emit("navigate", None, Some(serde_json::json!({ "page": page })))
+            .map_err(|e| format!("navigate: {e}"))?;
+    }
+    // A few frames: the commit after `navigate`, the `app.info` promise
+    // resolving, and meters settling into motion. Time has to pass for the
+    // meters to show anything, so the frames are spaced out.
+    for _ in 0..12 {
+        demo.draw();
+        std::thread::sleep(std::time::Duration::from_millis(16));
+    }
+    let surface = demo.surface.as_mut().ok_or("no surface")?;
+    let mut pixels = surface.read_pixels().map_err(|e| format!("read back: {e}"))?;
+    for px in pixels.chunks_exact_mut(4) {
+        // Premultiplied to straight alpha for PNG. The frame is opaque, so this
+        // only matters if someone makes the window transparent.
+        let a = u32::from(px[3]);
+        if a != 0 && a != 255 {
+            for c in &mut px[..3] {
+                *c = ((u32::from(*c) * 255 + a / 2) / a).min(255) as u8;
+            }
+        }
+    }
+    let (w, h) = (physical.width.get() as u32, physical.height.get() as u32);
+    image::save_buffer(out, &pixels, w, h, image::ExtendedColorType::Rgba8)
+        .map_err(|e| format!("write {out}: {e}"))?;
+    println!("wrote {out} ({w}x{h}, page {page}, renderer {RENDERER_KIND})");
+    // V8's callbacks borrow the bridge; drop in the same order as `exiting`.
+    demo.surface = None;
+    demo.js = None;
+    Ok(())
+}
+
+/// Synthesised channel levels for the mixer's meters, in `0..=1`.
+///
+/// Four plausible-looking signals — a kick on the beat, a bass line, a pad and
+/// a phrased vocal — so the meters move like music rather than like noise. The
+/// point is the transport, not the audio: these numbers cross into JavaScript
+/// as an event every frame.
+fn meter_levels(t: f32) -> [f32; 4] {
+    let beat = (t * 2.0).fract();
+    let kick = (1.0 - beat).powi(4);
+    let bass = 0.55 + 0.25 * (t * 4.0).sin() * (t * 0.5).sin().abs();
+    let keys = 0.35 + 0.15 * (t * 1.3).sin() + 0.1 * (t * 7.1).sin();
+    let phrase = ((t * 0.25).fract() < 0.7) as u8 as f32;
+    let vocal = phrase * (0.5 + 0.3 * (t * 5.0).sin().abs());
+    [kick, bass, keys, vocal].map(|v| v.clamp(0.0, 1.0))
 }
 
 /// The application shell.
@@ -99,6 +212,16 @@ struct ReactDemo {
     quit: Rc<Cell<bool>>,
     /// Why the JavaScript runtime is unavailable, when it is.
     js_error: Option<String>,
+    /// Set by `app.setAnimating`: redraw every frame (the mixer's meters)
+    /// rather than only on input.
+    animating: Rc<Cell<bool>>,
+    /// What `app.info` answers. Filled in once the surface exists, which is
+    /// before JavaScript starts, so the first request already has it.
+    info: Rc<RefCell<serde_json::Value>>,
+    /// Frames presented since `fps_window` began, for the fps readout.
+    fps_frames: u32,
+    fps_window: Instant,
+    fps: f32,
 }
 
 impl ReactDemo {
@@ -114,6 +237,11 @@ impl ReactDemo {
             frames: 0,
             quit: Rc::new(Cell::new(false)),
             js_error: None,
+            animating: Rc::new(Cell::new(false)),
+            info: Rc::new(RefCell::new(serde_json::Value::Null)),
+            fps_frames: 0,
+            fps_window: Instant::now(),
+            fps: 0.0,
         }
     }
 
@@ -140,6 +268,14 @@ impl ReactDemo {
             bridge.register_method("app.quit", move |_host, _params| {
                 quit.set(true);
                 Ok(serde_json::Value::Null)
+            });
+            let info = Rc::clone(&self.info);
+            bridge.register_method("app.info", move |_host, _params| Ok(info.borrow().clone()));
+            let animating = Rc::clone(&self.animating);
+            bridge.register_method("app.setAnimating", move |_host, params| {
+                let on = params.get("on").and_then(serde_json::Value::as_bool).unwrap_or(false);
+                animating.set(on);
+                Ok(serde_json::Value::Bool(on))
             });
         }
 
@@ -188,7 +324,7 @@ impl ReactDemo {
         div()
             .flex_col()
             .full()
-            .bg(Color::hex(0x202124))
+            .bg(BACKGROUND)
             .child(div().flex_col().flex_1().child(content))
             .child(self.status_bar())
             .into_element()
@@ -215,8 +351,14 @@ impl ReactDemo {
         let bar_style =
             self.stylesheet.resolve_in(&MatchPath::new(bar), None, &context).apply_to(div());
 
+        let backend = self
+            .surface
+            .as_ref()
+            .map(|s| format!("{:?}", s.backend()))
+            .unwrap_or_else(|| "no surface".into());
         bar_style
             .child(item(format!("frame {}", self.frames), "status-item live"))
+            .child(item(backend, "status-item"))
             .child(item(format!("{nodes} react nodes"), "status-item"))
             .child(item(format!("renderer: {RENDERER_KIND}"), "status-item"))
             .child(item(format!("v8 {}", spherekit_bridge::v8_version()), "status-item"))
@@ -236,7 +378,7 @@ impl ReactDemo {
             .child(label("JavaScript runtime unavailable").text_size(px(20.0)))
             .child(label(reason).text_size(px(13.0)).text_color(Color::hex(0xACADB0)))
             .child(
-                label("The V8 prebuilt is Windows x86_64 only today; see docs/javascript.md.")
+                label("See docs/javascript.md for how V8 is fetched and linked.")
                     .text_size(px(12.0))
                     .text_color(Color::hex(0x78797C)),
             )
@@ -254,20 +396,51 @@ impl ReactDemo {
         self.tick_javascript();
         let root = self.build();
         let Some(surface) = self.surface.as_mut() else { return };
-        match surface.render(root, Color::hex(0x202124)) {
-            Ok(Some(_)) => self.frames += 1,
+        let mut cpu_ms = 0.0;
+        match surface.render(root, BACKGROUND) {
+            Ok(Some(stats)) => {
+                self.frames += 1;
+                self.fps_frames += 1;
+                cpu_ms = stats.cpu_ms;
+            }
             Ok(None) => {}
             Err(error) => eprintln!("frame failed: {error}"),
         }
+        let window = self.fps_window.elapsed().as_secs_f32();
+        if window >= 0.5 {
+            self.fps = self.fps_frames as f32 / window;
+            self.fps_frames = 0;
+            self.fps_window = Instant::now();
+        }
 
         // Tell JavaScript a frame happened. This is the native -> JS direction
-        // with no React component involved: the header's counter is driven by
-        // an event the Rust side raises on its own.
+        // with no React component involved: the header's readout is driven by
+        // events the Rust side raises on its own.
         if let Some(js) = self.js.as_mut() {
-            let payload = serde_json::json!({ "count": self.frames });
+            let payload = serde_json::json!({
+                "count": self.frames,
+                "fps": self.fps,
+                "cpuMs": cpu_ms,
+            });
             if let Err(error) = js.emit("frame", None, Some(payload)) {
                 eprintln!("frame event failed: {error}");
             }
+            if self.animating.get() {
+                let levels = meter_levels(self.started.elapsed().as_secs_f32());
+                if let Err(error) =
+                    js.emit("meters", None, Some(serde_json::json!({ "levels": levels })))
+                {
+                    eprintln!("meters event failed: {error}");
+                }
+            }
+        }
+
+        // While the mixer animates, every frame schedules the next; vsync
+        // paces it. Otherwise the app sleeps until input arrives.
+        if self.animating.get()
+            && let Some(window) = self.window.as_ref()
+        {
+            window.request_redraw();
         }
     }
 }
@@ -278,9 +451,9 @@ impl AppHandler for ReactDemo {
             return;
         }
 
-        let attrs = WindowAttributes::new("SphereKit — React")
-            .with_inner_size(size(px(760.0), px(620.0)))
-            .with_min_inner_size(size(px(480.0), px(400.0)))
+        let attrs = WindowAttributes::new("SphereKit Studio — React in V8")
+            .with_inner_size(size(px(980.0), px(680.0)))
+            .with_min_inner_size(size(px(720.0), px(520.0)))
             .with_visible(false);
         let window = match cx.create_window(&attrs) {
             Ok(window) => window,
@@ -299,6 +472,15 @@ impl AppHandler for ReactDemo {
         )) {
             Ok(mut surface) => {
                 println!("adapter: {}", surface.adapter_name());
+                let timing = surface.init_timing();
+                *self.info.borrow_mut() = serde_json::json!({
+                    "backend": format!("{:?}", surface.backend()),
+                    "adapter": surface.adapter_name(),
+                    "v8": spherekit_bridge::v8_version(),
+                    "renderer": RENDERER_KIND,
+                    "scale": window.scale_factor().get(),
+                    "initMs": timing.total_ms(),
+                });
                 surface.set_theme(match window.theme().unwrap_or(PlatformTheme::Dark) {
                     PlatformTheme::Light => Theme::light(),
                     PlatformTheme::Dark => Theme::dark(),
@@ -306,7 +488,7 @@ impl AppHandler for ReactDemo {
                 self.surface = Some(surface);
             }
             Err(error) => {
-                eprintln!("failed to create a GPU surface: {error}");
+                eprintln!("failed to create a rendering surface: {error}");
                 cx.exit();
                 return;
             }
@@ -422,7 +604,6 @@ mod tests {
 
     /// Boots the whole pipeline headlessly: V8, the prelude, the bundle, the
     /// stylesheet and the React host. No window and no GPU.
-    #[cfg(windows)]
     fn boot() -> JsBridge {
         let mut js = JsBridge::new().expect("V8 starts");
         js.bridge_mut().host_mut().set_stylesheet(STYLESHEET).expect("stylesheet installs");
@@ -431,7 +612,6 @@ mod tests {
         js
     }
 
-    #[cfg(windows)]
     #[test]
     fn the_renderer_commits_a_tree_that_lowers_to_native_elements() {
         // The end-to-end claim, with no window in it: JavaScript running in V8
@@ -448,7 +628,6 @@ mod tests {
         assert!(tree.stats().elements > 5, "lowered to {} elements", tree.stats().elements);
     }
 
-    #[cfg(windows)]
     #[test]
     fn a_native_event_drives_a_react_re_render() {
         // This is a regression test for a duplicate-React install, which is the
@@ -463,7 +642,8 @@ mod tests {
         let mut js = boot();
         let before = js.bridge().host().tree().revision;
 
-        js.emit("frame", None, Some(serde_json::json!({ "count": 1 }))).expect("event delivers");
+        js.emit("frame", None, Some(serde_json::json!({ "count": 1, "fps": 60.0, "cpuMs": 0.5 })))
+            .expect("event delivers");
         js.tick().expect("tick runs");
         js.tick().expect("second tick runs");
 
@@ -473,6 +653,51 @@ mod tests {
             "a native event produced no new commit ({before} -> {after}); React is very likely \
              installed twice — check that `react` resolves to one instance across the workspace"
         );
+    }
+
+    #[test]
+    fn meter_levels_stay_in_range_and_move() {
+        let mut previous = meter_levels(0.0);
+        let mut moved = false;
+        for step in 1..400 {
+            let levels = meter_levels(step as f32 / 60.0);
+            assert!(levels.iter().all(|l| (0.0..=1.0).contains(l)), "{levels:?}");
+            moved |= levels != previous;
+            previous = levels;
+        }
+        assert!(moved, "the meters never moved");
+    }
+
+    /// The mixer page asks for animation on mount; the host must hear it.
+    #[test]
+    fn the_mixer_turns_on_animation_and_meters_reach_react() {
+        let demo = ReactDemo::new();
+        let animating = Rc::clone(&demo.animating);
+        let mut js = JsBridge::new().expect("V8 starts");
+        {
+            let mut bridge = js.bridge_mut();
+            bridge.host_mut().set_stylesheet(STYLESHEET).expect("stylesheet installs");
+            let flag = Rc::clone(&animating);
+            bridge.register_method("app.setAnimating", move |_host, params| {
+                flag.set(params.get("on").and_then(serde_json::Value::as_bool).unwrap_or(false));
+                Ok(serde_json::Value::Null)
+            });
+            bridge.register_method("app.info", |_host, _params| Ok(serde_json::Value::Null));
+        }
+        js.install_prelude(PRELUDE).expect("prelude evaluates");
+        js.load(RENDERER, "app.js").expect("the renderer bundle evaluates");
+        for _ in 0..3 {
+            js.tick().expect("tick runs");
+        }
+        if RENDERER_KIND == "react" {
+            assert!(animating.get(), "the mixer page did not ask the host to animate");
+            let before = js.bridge().host().tree().revision;
+            js.emit("meters", None, Some(serde_json::json!({ "levels": meter_levels(0.3) })))
+                .expect("meters deliver");
+            js.tick().expect("tick runs");
+            js.tick().expect("second tick runs");
+            assert!(js.bridge().host().tree().revision > before, "meters produced no commit");
+        }
     }
 
     #[test]

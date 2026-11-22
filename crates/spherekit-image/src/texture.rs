@@ -73,8 +73,8 @@ impl TexelFormat {
 
 /// Everything the backend needs to allocate a texture for a decoded image.
 ///
-/// A plain description rather than a builder: it is copied into a wgpu
-/// descriptor at the call site, and interposing a builder would only add a
+/// A plain description rather than a builder: it is copied into a backend
+/// texture descriptor at the call site, and interposing a builder would only add a
 /// second place for the mip count to disagree with the level list.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct TextureDesc {

@@ -856,8 +856,8 @@ impl DesktopApp {
                     ),
             )
             .child(separator(false).bg(Color::TRANSPARENT))
-            // A type specimen. Every size below goes through the same MTSDF
-            // path, and the two smallest cross into the bitmap fallback.
+            // A type specimen. Every size is rasterised for its exact device
+            // size — by DirectWrite on Windows — and cached per size.
             .child(
                 label("Type specimen")
                     .text_size(theme.typography.md)
@@ -1215,7 +1215,6 @@ impl Element for CaptionButton {
             &layout,
             origin,
             colour,
-            spherekit::render::TextRasterMode::Auto,
             (Px::ZERO, Color::TRANSPARENT),
             spherekit::render::coverage_contrast_for(colour, background),
         );

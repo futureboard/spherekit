@@ -256,7 +256,7 @@ fn push_frame(replies: &mut Vec<String>, message: &BridgeMessage) {
     replies.push(frame.unwrap_or_else(|_| UNSERIALIZABLE.to_owned()));
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;

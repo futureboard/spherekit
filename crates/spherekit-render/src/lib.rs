@@ -1,8 +1,9 @@
 //! # spherekit-render
 //!
 //! The rendering core: a canvas API, a flat display list, a batch compiler, and
-//! the backend seam. No GPU dependency lives here — `spherekit-wgpu` implements
-//! [`RendererBackend`], and everything above this crate is backend-agnostic.
+//! the backend seam. No GPU dependency lives here — `spherekit-d3d11` and
+//! `spherekit-skia` implement [`RendererBackend`], and everything above this
+//! crate is backend-agnostic.
 //!
 //! ## The frame
 //!
@@ -74,10 +75,9 @@ pub use primitives::{
     QuadInstance, glyph_flags, gradient_kind, quad_flags,
 };
 pub use scene::{
-    Clip, ClipKind, DrawCommand, FULL_COVERAGE_CONTRAST, Filter, GlyphRun, Layer, MAX_EDGE_BIAS_PX,
-    MIN_EDGE_RAMP_PX, Mesh, MeshVertex, PositionedGlyph, QuadCommand, SMALL_TEXT_MAX_DEVICE_PX,
-    Scene, SceneIndex, SceneStats, TextRasterMode, alpha_from_coverage, coverage_contrast_for,
-    mtsdf_edge_ramp,
+    Clip, ClipKind, DrawCommand, FULL_COVERAGE_CONTRAST, Filter, GlyphRun, Layer, Mesh, MeshVertex,
+    PositionedGlyph, QuadCommand, Scene, SceneIndex, SceneStats, alpha_from_coverage,
+    coverage_contrast_for,
 };
 pub use tessellate::{TessellationError, TessellationOptions, Tessellator};
 
@@ -86,6 +86,6 @@ pub mod prelude {
     pub use crate::backend::{PresentPreference, RendererBackend, SurfaceConfig, VsyncMode};
     pub use crate::batch::{BatchCompiler, CompiledFrame, GlyphProvider, TextureProvider};
     pub use crate::canvas::Canvas;
-    pub use crate::scene::{Mesh, MeshVertex, Scene, TextRasterMode};
+    pub use crate::scene::{Mesh, MeshVertex, Scene};
     pub use spherekit_core::prelude::*;
 }

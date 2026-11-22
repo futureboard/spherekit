@@ -37,7 +37,6 @@ use crate::semantics::{Role, Semantics};
 use crate::style::PaintStyle;
 use spherekit_core::{Color, Corners, ElementId, Point, Px, Rect, RoundedRect, Size, px, relative};
 use spherekit_layout::Style;
-use spherekit_render::TextRasterMode;
 
 /// Which set of keys is showing.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
@@ -540,7 +539,6 @@ impl Element for VirtualKeyboard {
                 &layout,
                 origin,
                 ink,
-                TextRasterMode::Auto,
                 (Px::ZERO, Color::TRANSPARENT),
                 spherekit_render::coverage_contrast_for(ink, fill),
             );

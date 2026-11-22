@@ -14,7 +14,7 @@ this was developed against.
 | No layout work for paint-only updates | `DirtyFlags::PAINT` does not propagate |
 | Very low allocation per frame | Reused scenes, growable buffers, pooled targets |
 | Minimal draw calls | Run-length batching, one pipeline for the common primitive |
-| Fast text cache hits | Shaping cache, size-independent glyph fields |
+| Fast text cache hits | Shaping cache, glyph bitmaps cached per size and phase in the atlas |
 
 ## The counters
 
@@ -51,13 +51,19 @@ rather than useful.
 | `batches` | **Draw calls.** A jump at constant wall-clock is still a regression |
 | `quads` / `glyphs` / `triangles` | Instance counts by kind |
 
-### `FrameStats` — `spherekit-wgpu`
+### `FrameStats` — `spherekit-d3d11` or `spherekit-skia`
 
 | Counter | Watch for |
 |---|---|
 | `draw_calls`, `pipeline_switches` | State changes, the thing batching exists to reduce |
 | `bytes_uploaded` | Should fall to near-constant once caches are warm |
 | `layers` | Each one is a render target and an extra pass |
+
+Both backends fill in the same struct, so the workload counters are comparable across them, and
+`SphereKitSurface::backend()` says which one produced the numbers. `cpu_ms` is not comparable: Skia
+reports the time its `render` took, which *is* the rasterisation, while Direct3D 11 leaves it at zero.
+`SurfaceStats::cpu_ms` — build, layout, paint, compile and upload, measured by the surface — is the
+number to compare.
 
 ### Text and atlas
 
@@ -68,11 +74,12 @@ rather than useful.
 | `AtlasStats::utilization` | Low with many pages means packing is fragmenting |
 | `CacheStats::collisions` | Expected to stay at zero forever |
 
-### Buffers
+### Memory
 
-`GrowableBuffer::grew()` counts reallocations over the buffer's lifetime. In steady state it stops
-increasing. A number that keeps climbing means a workload is still growing, or is oscillating
-around a capacity boundary.
+`RendererBackend::memory_usage` reports the bytes a backend holds: textures, instance and table
+buffers, pooled layer targets and, on Direct3D 11, the surface's multisampled twin. In steady state
+it stops changing. A number that keeps climbing means a workload is still growing, or a pool is not
+being reaped.
 
 ## Per-frame allocation
 
@@ -80,10 +87,12 @@ Designed out rather than optimised later:
 
 - `Scene::reset` clears nine vectors and keeps every allocation. A fresh `Scene` per frame would
   re-grow all nine every time.
-- `GrowableBuffer` grows geometrically to a power of two and never shrinks in normal operation.
+- Direct3D 11's dynamic buffers grow to a power of two and never shrink; they are rewritten with
+  `Map(WRITE_DISCARD)`, so the driver renames them instead of stalling.
 - `Tessellator` holds `lyon`'s scratch buffers across frames.
-- Offscreen layer targets come from a pool keyed on size, released after 60 unused frames. Freeing
-  them the moment one frame skips them would reallocate every time a menu opened and closed.
+- Offscreen layer targets come from a pool keyed on size, released after 60 unused frames, on both
+  backends. Freeing them the moment one frame skips them would reallocate every time a menu opened
+  and closed.
 - `RealtimeFrame` carries a scratch `Vec` for envelope extraction; a test asserts its capacity stops
   changing after the second frame.
 - Hit testing has a `hit_test_all_into` variant, because hit testing runs on every mouse move and
@@ -102,27 +111,28 @@ eight hours is not a performance problem, it is a crash.
 | Shaping | text + style + width | Bytes, LRU |
 | Glyph atlas | `GlyphKey` | Page count, LRU page eviction, idle-frame eviction |
 | Image | Content hash | Bytes, LRU, with a this-frame guard |
-| Pipeline | kind + target format + sample count | Bounded by construction — a fixed set |
+| Direct3D 11 shaders and states | — | A fixed set, created once at device creation from precompiled bytecode |
 | SVG geometry | id + size + scale | Bytes, LRU |
 
 ## What multisampling costs
 
-The surface and every offscreen layer are multisampled 4× so that tessellated paths have smooth
-edges. That is not free:
+On Direct3D 11 the surface and every offscreen layer are multisampled 4× so that tessellated paths
+have smooth edges. That is not free:
 
 - The surface's multisampled attachment is `width × height × 4 bytes × samples`. At 1180×720 that is
   roughly 13 MB; at 4K it is roughly 130 MB.
 - Every layer allocates a second texture, because a multisampled texture cannot be sampled and has
   to resolve into a plain one before compositing.
-- `WgpuRenderer::memory_usage` accounts for both, so the cost is visible rather than inferred.
+- `memory_usage` accounts for both, so the cost is visible rather than inferred.
 
-Two things keep it from being worse than it needs to be. The multisampled attachment stores
-`Discard` on any pass that will not be resumed, so the 4× buffer is never written back to memory —
-only the resolve is. And the count is chosen once at startup from what the formats actually support,
-so a device that cannot manage 4× silently runs at the highest it can rather than failing.
+Two things keep it from being worse than it needs to be. Resolves are lazy: a target is resolved only
+when something is about to read it, and the surface once at the end of the frame. And the count is
+chosen once at startup from what the formats actually support, so a device that cannot manage 4×
+silently runs at the highest it can rather than failing.
 
 `SurfaceOptions::msaa_samples = 1` turns it off entirely. Everything except tessellated paths is
-antialiased analytically and looks identical either way.
+antialiased analytically and looks identical either way. The Skia backend has no sample count; the
+option only switches antialiasing for its path meshes on or off.
 
 ## Culling and batching
 
@@ -136,7 +146,10 @@ rectangles sharing a clip become one draw call, and a test asserts exactly that.
 
 ## Measured on one machine
 
-NVIDIA GTX 1060 3 GB, Vulkan, Windows 11, `--release`, 180 frames of the plug-in demo:
+NVIDIA GTX 1060 3 GB, Windows 11, `--release`, 180 frames of the plug-in demo. These figures predate
+the move from wgpu (here on Vulkan) to Direct3D 11 and from distance-field to bitmap text, and have
+not been re-measured since. The batch compiler that determines the draw-call and instance counts is
+the same; the backend and the text path are not.
 
 ```text
 draw calls:          26
@@ -155,7 +168,7 @@ worst cpu frame:     2.243 ms
 glyph texels up:     0
 ```
 
-Read that as: ten thousand rectangles, multilingual MTSDF text and three continuously-animating
+Read that as: ten thousand rectangles, multilingual text and three continuously-animating
 realtime visualisations, at roughly one millisecond of CPU per frame, with the layout engine doing
 **nothing at all**.
 
@@ -166,15 +179,45 @@ Twenty-six for a full plug-in editor is the expected shape, not a defect.
 These are figures from one GPU on one machine, reported because they were measured. They are not a
 guarantee about yours.
 
+### The Skia backend
+
+`crates/spherekit-skia/tests/bench.rs` renders a dense 1920×1080 frame — 2000 quads (plain, rounded,
+bordered, a few shadows) and 3000 glyphs in 100 runs — on the CPU. Median in `--release` on the
+development machine:
+
+```text
+clear       0.15 ms
+quads       3.55 ms
+glyphs      2.0  ms   (one draw_atlas per run)
+frame       5.5  ms
+```
+
+That is the fallback's budget: inside a 60 Hz frame for a dense interface, and the reason glyphs are
+plain bitmaps rather than anything that needs per-pixel reconstruction (see `docs/text.md`).
+
 ## Reproducing
 
 ```bash
 # Bounded run that prints the report above.
 SPHEREKIT_DEMO_FRAMES=180 cargo run -p spherekit --example plugin_ui_demo --release
 
-# GPU-side validation: every shader through naga, every pipeline built.
-cargo test -p spherekit-wgpu --test pipelines -- --nocapture
+# Both backends' pixel suites. Direct3D 11 runs on WARP where there is no GPU,
+# and also compiles every HLSL shader and checks the embedded bytecode is current.
+cargo test -p spherekit-d3d11 -p spherekit-skia -- --nocapture
+
+# The Skia frame benchmark above.
+cargo test -p spherekit-skia --release --test bench -- --ignored --nocapture
+
+# A whole interface rendered offscreen to a PNG, through either backend.
+cargo run -p spherekit --example screenshot --release -- out.png
+SPHEREKIT_BACKEND=skia   cargo run -p spherekit --example screenshot --release -- skia.png
+SPHEREKIT_BACKEND=d3d11  cargo run -p spherekit --example screenshot --release -- d3d11.png
+SPHEREKIT_SCALE=2        cargo run -p spherekit --example screenshot --release -- hidpi.png
+SPHEREKIT_RASTER=outline cargo run -p spherekit --example screenshot --release -- outline.png
 ```
+
+`SPHEREKIT_RASTER=outline` swaps DirectWrite for the portable outline rasteriser, so the same
+interface can be compared across rasterisers as well as backends.
 
 On Windows, set `CARGO_INCREMENTAL=0` if a workspace-wide test run fails at the link step; see the
 build notes in the README.
@@ -185,12 +228,13 @@ Honesty about the gaps:
 
 - There is **no Criterion benchmark suite yet.** The counters above are what exists, and the demo's
   bounded run is the only end-to-end measurement. A benchmark crate is on the roadmap.
-- GPU frame time is not measured. `FrameStats::gpu_ms` is `None`; timestamp queries are detected as
-  a capability but not yet used.
-- No golden-image or screenshot tests exist, and there is no GPU readback path to build them on.
-  `spherekit-text`'s `glyph_quad_probe` example renders text to a PNG, but it re-implements the glyph
-  shader on the CPU rather than capturing a frame, so it can check geometry and not the GPU. The
-  two examples print a measured report under `SPHEREKIT_DEMO_FRAMES`, which catches *structural*
-  regressions — a jump in draw calls, a nonzero `nodes_laid_out` — but not visual ones.
-- The figures above come from one discrete NVIDIA GPU. Integrated graphics, Metal and a software
-  adapter are architecturally supported and untested for performance.
+- GPU frame time is not measured. `FrameStats::gpu_ms` is `None` on both backends: Direct3D 11 has
+  timestamp queries, but nothing reads them yet.
+- There are no golden-image tests yet. The readback path now exists —
+  `SphereKitSurface::new_offscreen` and `read_pixels` on both backends, which the screenshot example
+  uses and the backend pixel suites assert against — but nothing compares whole frames to stored
+  references. The demos' `SPHEREKIT_DEMO_FRAMES` report catches *structural* regressions — a jump in
+  draw calls, a nonzero `nodes_laid_out` — but not visual ones.
+- The demo figures above come from one discrete NVIDIA GPU, before the current backends existed.
+  Integrated graphics, WARP and the Skia backend on Linux and macOS are untested for end-to-end
+  performance.

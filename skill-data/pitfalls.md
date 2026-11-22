@@ -53,9 +53,8 @@ const` from the crate that owns it (`spherekit_react::PRELUDE` is the pattern).
 
 ## 5. A build script must not write into its own package
 
-`cargo package` refuses it, and rightly. `spherekit-jsengine` caches its V8
-prebuilt in a user-level directory keyed by the archive URL, not in
-`crates/spherekit-jsengine/`.
+`cargo package` refuses it, and rightly. (`spherekit-jsengine` no longer has a
+build script: the `v8` crate downloads its prebuilt into `target/`.)
 
 ## 6. The React root fills its parent
 

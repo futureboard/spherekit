@@ -141,7 +141,7 @@ fn run(
     // idle. Without this the loop would hold the GIL forever and every other
     // thread would stop at its next bytecode.
     let result = python.detach(|| runner::run_loop(config, render, on_event));
-    result.map_err(|error| PyRuntimeError::new_err(error))
+    result.map_err(PyRuntimeError::new_err)
 }
 
 /// Asks the window to close at the next turn of the loop.
@@ -160,7 +160,10 @@ fn quit() {
 /// Objects become `dict`, arrays `list`, numbers `int` or `float`. Used for
 /// event payloads, which are small and flat — this is not a general-purpose
 /// decoder and does not try to be.
-pub(crate) fn value_to_python<'py>(python: Python<'py>, value: &Value) -> PyResult<Bound<'py, PyAny>> {
+pub(crate) fn value_to_python<'py>(
+    python: Python<'py>,
+    value: &Value,
+) -> PyResult<Bound<'py, PyAny>> {
     Ok(match value {
         Value::Null => python.None().into_bound(python),
         Value::Bool(b) => b.into_pyobject(python)?.to_owned().into_any(),
@@ -279,8 +282,8 @@ mod tests {
         // float arriving as an int is a volume that snaps to zero.
         Python::initialize();
         Python::attach(|python| {
-            let value: Value = serde_json::from_str(r#"{"value":0.25,"text":"a","on":true}"#)
-                .expect("parses");
+            let value: Value =
+                serde_json::from_str(r#"{"value":0.25,"text":"a","on":true}"#).expect("parses");
             let object = value_to_python(python, &value).expect("converts");
             let dict = object.cast::<PyDict>().expect("an object becomes a dict");
             let volume: f64 =

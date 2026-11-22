@@ -8,3 +8,4 @@
 *.pyc
 crates/spherekit-dotnet/dotnet/**/bin/
 crates/spherekit-dotnet/dotnet/**/obj/
+/.bin

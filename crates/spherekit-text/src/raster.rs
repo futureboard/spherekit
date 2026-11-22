@@ -1,13 +1,8 @@
-//! Grayscale coverage rasterisation, the small-text fallback to MTSDF.
+//! Coverage rasterisation from font outlines: the portable glyph rasteriser.
 //!
-//! ## Why a second path exists at all
-//!
-//! A distance field is sampled, and sampling has a resolution. Below roughly a
-//! dozen device pixels per em a stem is barely one texel wide in the field, so
-//! the reconstructed edge wanders by a noticeable fraction of a pixel from glyph
-//! to glyph and the text shimmers when the view scrolls. At those sizes the
-//! cheapest fix is also the oldest one: rasterise the outline directly at the
-//! exact pixel size and cache the bitmap.
+//! Every glyph is rasterised at its exact device size. On Windows DirectWrite
+//! normally does this job (see [`crate::dwrite`]); this module is what runs
+//! everywhere else, and wherever DirectWrite cannot load a face.
 //!
 //! ## The algorithm
 //!
@@ -24,54 +19,9 @@
 //! into coverage error at the boundary.
 
 use crate::hint::{GridFit, VerticalZones};
-use crate::mtsdf::{Shape, extract_shape};
+use crate::outline::{Shape, extract_shape};
 use crate::types::{GlyphFormat, GlyphImage};
 use spherekit_core::{FontError, GlyphId, Point, Px, Rect, ScaleFactor, Size};
-
-/// Physical pixel size below which the grayscale fallback wins.
-///
-/// Twenty-four, because that is where **bilinear sampling stops being able to
-/// reconstruct the field**. A glyph field is generated at
-/// [`crate::mtsdf::DEFAULT_EM_SIZE_PX`] — 48 texels per em — and drawn at the
-/// device size, so rendering at *d* device pixels minifies it by `48 / d`. A
-/// bilinear tap averages a 2x2 texel footprint; once the true footprint is
-/// wider than that, most of the texels that should have contributed are simply
-/// not read, and what comes back is a low-pass blur of the outline rather than
-/// a reconstruction of it. `48 / 24 = 2`, so 24 is the exact size at which the
-/// footprint stops fitting.
-///
-/// The second reason lands at the same place. The shader's antialiasing ramp is
-/// one device pixel wide by construction (`screen_range` is clamped to 1), and a
-/// regular-weight stem is about `em / 9`. So the solid core of a stem is
-/// `d / 9 - 1` pixels:
-///
-/// | device px | field minified | stem | solid core |
-/// |---|---|---|---|
-/// | 13 | 3.7x | 1.44 px | **0.44 px** |
-/// | 16 | 3.0x | 1.78 px | 0.78 px |
-/// | 24 | 2.0x | 2.67 px | 1.67 px |
-/// | 26 | 1.9x | 2.89 px | 1.89 px |
-///
-/// At 13 device pixels — a 13 px label on a 100 % display, which is most
-/// interface text ever written — the two ramps very nearly meet in the middle
-/// and the stem never reaches full opacity. That is what soft text *is*, and no
-/// amount of gamma correction fixes it, because the coverage genuinely is grey.
-///
-/// The previous value of 12 was chosen from a different and incorrect premise:
-/// that the field runs short of *texels*. It does not. A 48-per-em field has
-/// plenty of texels at any interface size; the problem is reading them.
-///
-/// It is a threshold on *device* pixels deliberately: 13 logical pixels on a
-/// 200 % display is 26 physical pixels and reconstructs correctly, while 13
-/// logical pixels at 100 % does not. Deciding on logical size would get exactly
-/// one of those two cases wrong.
-///
-/// **What it costs.** Bitmaps are keyed per device size, so an interface with
-/// five type sizes at one scale factor holds five sets of glyphs instead of one
-/// size-independent set. That is the trade the fallback exists to make. Content
-/// that zooms continuously should ask for [`RasterStrategy::Mtsdf`] explicitly
-/// through `TextRasterMode::Mtsdf`, which is what that escape hatch is for.
-pub const BITMAP_MAX_DEVICE_PX: f32 = 24.0;
 
 /// Curve flattening tolerance in device pixels.
 ///
@@ -96,41 +46,17 @@ const LCD_HORIZONTAL_SCALE: f32 = 3.0;
 /// The five-tap filter reaches two high-resolution samples in either direction.
 const LCD_FILTER_RADIUS_PX: f32 = 2.0 / LCD_HORIZONTAL_SCALE;
 
-/// Which rasterisation path a glyph should take.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum RasterStrategy {
-    /// The size-independent multi-channel distance field.
-    Mtsdf,
-    /// A grayscale bitmap rasterised for one exact device size.
-    Bitmap,
-}
-
 /// The em size in physical pixels, which is what every decision here keys off.
 #[inline]
 pub fn device_font_size(font_size: Px, scale: ScaleFactor) -> f32 {
     (font_size.get() * scale.get()).max(0.0)
 }
 
-/// Chooses between the distance field and the bitmap fallback.
-///
-/// This is the policy behind `TextRasterMode::Auto`; callers that have been told
-/// `Mtsdf` or `Bitmap` explicitly should not consult it. It lives here rather
-/// than in the renderer because the threshold is a property of what the
-/// rasteriser can deliver, not of how a scene was recorded.
-#[inline]
-pub fn choose_raster_strategy(font_size: Px, scale: ScaleFactor) -> RasterStrategy {
-    if device_font_size(font_size, scale) < BITMAP_MAX_DEVICE_PX {
-        RasterStrategy::Bitmap
-    } else {
-        RasterStrategy::Mtsdf
-    }
-}
-
 /// The rounded device pixel size a bitmap glyph should be rasterised at.
 ///
-/// Rounded, because the whole point of the fallback is landing on the pixel
-/// grid; and clamped away from zero, because a zero here would collide with the
-/// distance-field sentinel in [`crate::types::GlyphKey`].
+/// Rounded, because a bitmap is only reusable at the size it was drawn for and
+/// the cache key has to name that size; clamped away from zero, because no
+/// glyph is rasterised at zero pixels.
 #[inline]
 pub fn bitmap_size_px(font_size: Px, scale: ScaleFactor) -> u16 {
     let size = device_font_size(font_size, scale).round();
@@ -432,8 +358,6 @@ fn rasterize_shape_fitted_for_format(
             Point::new(x0 / size_px, y0 / size_px),
             Size::new(width / size_px, height / size_px),
         ),
-        // Coverage is not a distance field; there is no range to travel with it.
-        range_em: 0.0,
     }
 }
 
@@ -489,7 +413,7 @@ fn snap_out(px: f32, up: bool) -> f32 {
 ///
 /// `size_px` is the em size in *device* pixels; use [`device_font_size`] to get
 /// it from a logical size and a scale factor. Glyphs with no outline produce an
-/// empty image rather than an error, exactly as in the distance-field path.
+/// empty image rather than an error: it is a normal glyph that draws nothing.
 pub fn rasterize_glyph(
     face: &ttf_parser::Face<'_>,
     glyph: GlyphId,
@@ -544,8 +468,7 @@ pub fn rasterize_glyph_with_zones(
     zones: Option<VerticalZones>,
 ) -> Result<GlyphImage, FontError> {
     let shape = extract_shape(face, glyph)?;
-    // Grid-fitting is a property of this path and not of the distance field,
-    // which is size-independent and therefore has no single size to fit to.
+    // Fitting needs the exact device size, which is what this path is given.
     let fit = zones.and_then(|z| GridFit::new(&z, size_px));
     Ok(rasterize_shape_fitted(&shape, size_px, fit.as_ref()))
 }
@@ -593,7 +516,7 @@ pub fn rasterize_glyph_subpixel_with_zones(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mtsdf::{EdgeSegment, glyph_metrics};
+    use crate::outline::{EdgeSegment, glyph_metrics};
     use spherekit_core::px;
 
     fn p(x: f32, y: f32) -> Point<f32> {
@@ -762,7 +685,6 @@ mod tests {
         let img = rasterize_shape(&Shape::new(), 12.0);
         assert!(img.is_empty());
         assert_eq!(img.format, GlyphFormat::Grayscale);
-        assert_eq!(img.range_em, 0.0);
         assert!(img.data.is_empty());
     }
 
@@ -858,7 +780,7 @@ mod tests {
         // flattened finely enough.
         let k = 0.552_285_f32 * 0.25;
         let r = 0.25_f32;
-        let mut contour = crate::mtsdf::Contour::new();
+        let mut contour = crate::outline::Contour::new();
         for (a, b, c, d) in [
             (p(r, 0.0), p(r, k), p(k, r), p(0.0, r)),
             (p(0.0, r), p(-k, r), p(-r, k), p(-r, 0.0)),
@@ -879,83 +801,13 @@ mod tests {
         assert_eq!(img.data[0], 0);
     }
 
-    // -- the MTSDF-versus-bitmap policy -------------------------------------
-
-    #[test]
-    fn the_policy_thresholds_on_physical_pixels_not_logical_ones() {
-        let one = ScaleFactor::new(1.0);
-        let two = ScaleFactor::new(2.0);
-        // 13 logical pixels is ordinary body text, and it decides differently on
-        // the two displays: 13 device pixels minifies the field 3.7x and comes
-        // out soft, 26 minifies it 1.9x and comes out sharp. This is the exact
-        // case the threshold was moved for.
-        assert_eq!(choose_raster_strategy(px(13.0), one), RasterStrategy::Bitmap);
-        assert_eq!(choose_raster_strategy(px(13.0), two), RasterStrategy::Mtsdf);
-        // ...and a large logical size at a tiny scale falls back.
-        assert_eq!(choose_raster_strategy(px(20.0), ScaleFactor::new(0.5)), RasterStrategy::Bitmap);
-    }
-
-    #[test]
-    fn the_policy_boundary_is_where_bilinear_sampling_gives_out() {
-        // 48 texels per em over 24 device pixels is exactly 2x minification,
-        // which is the widest footprint a 2x2 bilinear tap still covers.
-        let one = ScaleFactor::new(1.0);
-        assert_eq!(choose_raster_strategy(px(23.99), one), RasterStrategy::Bitmap);
-        assert_eq!(choose_raster_strategy(px(24.0), one), RasterStrategy::Mtsdf);
-        assert_eq!(choose_raster_strategy(px(24.01), one), RasterStrategy::Mtsdf);
-        // Fractional scaling, the case that actually ships: 1.25 and 1.5.
-        assert_eq!(choose_raster_strategy(px(20.0), ScaleFactor::new(1.25)), RasterStrategy::Mtsdf);
-        assert_eq!(
-            choose_raster_strategy(px(16.0), ScaleFactor::new(1.25)),
-            RasterStrategy::Bitmap
-        );
-        assert_eq!(choose_raster_strategy(px(16.0), ScaleFactor::new(1.5)), RasterStrategy::Mtsdf);
-    }
-
-    /// The two thresholds are the same number on purpose, and this is the only
-    /// place both are visible: `spherekit-render` cannot see this crate.
-    ///
-    /// What the equality buys is that the small-text edge compensation in
-    /// `text.wgsl` is *unreachable* under `TextRasterMode::Auto`. Every glyph
-    /// `Auto` sends to the field path is at least [`BITMAP_MAX_DEVICE_PX`]
-    /// device pixels, and the compensation is inert at and above
-    /// `SMALL_TEXT_MAX_DEVICE_PX`, so no interface drawn through the shipped
-    /// widgets renders one bit differently for it. The compensation exists for
-    /// callers who have taken the `TextRasterMode::Mtsdf` escape hatch — content
-    /// that zooms continuously, which cannot afford a per-size bitmap — and it
-    /// is only those callers who see it.
-    #[test]
-    fn auto_never_reaches_the_small_text_compensation() {
-        assert_eq!(
-            BITMAP_MAX_DEVICE_PX,
-            spherekit_render::SMALL_TEXT_MAX_DEVICE_PX,
-            "the raster threshold and the compensation ceiling have drifted apart"
-        );
-
-        // Swept rather than asserted: every size and scale a display can
-        // produce, checked against both halves of the rule at once.
-        for size in 1..=400 {
-            for scale in [0.5f32, 1.0, 1.25, 1.5, 1.75, 2.0, 3.0] {
-                let font_size = px(size as f32 * 0.25);
-                let scale = ScaleFactor::new(scale);
-                if choose_raster_strategy(font_size, scale) != RasterStrategy::Mtsdf {
-                    continue;
-                }
-                let em_px = device_font_size(font_size, scale);
-                let px_range = em_px * crate::mtsdf::GlyphRasterConfig::default().range_em();
-                let [_, offset] = spherekit_render::mtsdf_edge_ramp(em_px, px_range);
-                assert_eq!(offset, 0.0, "Auto sent {em_px} device px into the compensation");
-            }
-        }
-    }
-
     #[test]
     fn bitmap_sizes_round_to_whole_device_pixels_and_never_reach_zero() {
         assert_eq!(bitmap_size_px(px(11.0), ScaleFactor::new(1.0)), 11);
         assert_eq!(bitmap_size_px(px(11.0), ScaleFactor::new(1.5)), 17); // 16.5 rounds up
         assert_eq!(bitmap_size_px(px(9.4), ScaleFactor::new(1.0)), 9);
         assert_eq!(bitmap_size_px(px(9.6), ScaleFactor::new(1.0)), 10);
-        // A zero size would alias onto the distance-field key.
+        // Nothing is rasterised at zero pixels.
         assert_eq!(bitmap_size_px(px(0.0), ScaleFactor::new(1.0)), 1);
         assert_eq!(bitmap_size_px(px(0.2), ScaleFactor::new(1.0)), 1);
         assert_eq!(bitmap_size_px(px(f32::NAN), ScaleFactor::new(1.0)), 1);

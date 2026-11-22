@@ -3,7 +3,8 @@ resolver = "3"
 members = [
     "crates/spherekit-core",
     "crates/spherekit-render",
-    "crates/spherekit-wgpu",
+    "crates/spherekit-d3d11",
+    "crates/spherekit-skia",
     "crates/spherekit-text",
     "crates/spherekit-layout",
     "crates/spherekit-svg",
@@ -37,7 +38,8 @@ authors = ["Futureboard Digital Technologies"]
 # --- internal ---
 spherekit-core     = { path = "crates/spherekit-core",     version = "2026.8.0" }
 spherekit-render   = { path = "crates/spherekit-render",   version = "2026.8.0" }
-spherekit-wgpu     = { path = "crates/spherekit-wgpu",     version = "2026.8.0" }
+spherekit-d3d11    = { path = "crates/spherekit-d3d11",    version = "2026.8.0" }
+spherekit-skia     = { path = "crates/spherekit-skia",     version = "2026.8.0" }
 spherekit-text     = { path = "crates/spherekit-text",     version = "2026.8.0" }
 spherekit-layout   = { path = "crates/spherekit-layout",   version = "2026.8.0" }
 spherekit-svg      = { path = "crates/spherekit-svg",      version = "2026.8.0" }
@@ -67,7 +69,17 @@ parking_lot = "0.12"
 crossbeam-utils = "0.8"
 
 # --- gpu / platform ---
-wgpu = { version = "30.0", default-features = false, features = ["wgsl", "dx12", "vulkan", "metal", "webgpu"] }
+# Direct3D 11, DXGI, DirectComposition and DirectWrite. Each crate enables the
+# API features it uses on top of this.
+windows = { version = "0.62", default-features = false, features = ["std"] }
+# CPU rasteriser for the fallback backend. The default feature set
+# (binary-cache + pdf + jpeg) is deliberate: rust-skia publishes prebuilt
+# binaries only for specific feature combinations, and this is the smallest one
+# available for every desktop target. Changing it forces a from-source Skia
+# build, which needs the LLVM/Ninja that `tools/bootstrap.ps1` puts in `.bin/`.
+skia-safe = "0.157"
+# Software presentation for the Skia backend: GDI, X11/Wayland, CoreGraphics.
+softbuffer = { version = "0.4", default-features = false, features = ["x11", "wayland"] }
 raw-window-handle = "0.6"
 winit = "0.30.13"
 pollster = "1.0"

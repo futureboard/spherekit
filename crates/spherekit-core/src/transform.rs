@@ -181,8 +181,8 @@ impl Affine {
         Size { width: Px(self.tx), height: Px(self.ty) }
     }
 
-    /// An approximate uniform scale factor, used to pick MTSDF smoothing and
-    /// tessellation tolerance under zoom.
+    /// An approximate uniform scale factor, used to pick tessellation tolerance
+    /// under zoom.
     ///
     /// The square root of `|det|` is the area-preserving mean of the two axis
     /// scales, which behaves better than either axis alone under skew.
@@ -217,7 +217,7 @@ impl Affine {
         [self.a, self.b, self.c, self.d, self.tx, self.ty]
     }
 
-    /// Packs into two `vec4`s, the layout a WGSL uniform expects.
+    /// Packs into two `vec4`s, the layout a shader constant buffer expects.
     #[inline]
     pub fn to_gpu(self) -> [[f32; 4]; 2] {
         [[self.a, self.b, self.c, self.d], [self.tx, self.ty, 0.0, 0.0]]

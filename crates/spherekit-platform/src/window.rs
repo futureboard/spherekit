@@ -243,7 +243,7 @@ fn logical_size(physical: Size<DevicePx>, scale: ScaleFactor) -> Size<Px> {
 
 /// Something a renderer can create a surface for.
 ///
-/// This is the seam between `spherekit-platform` and `spherekit-wgpu`. Both variants
+/// This is the seam between `spherekit-platform` and the renderers. Both variants
 /// implement [`HasWindowHandle`] and [`HasDisplayHandle`], and
 /// [`WindowTarget::raw_handles`] exposes the pair directly for backends that
 /// need the unsafe surface-creation path (which is the one a foreign handle
@@ -251,8 +251,8 @@ fn logical_size(physical: Size<DevicePx>, scale: ScaleFactor) -> Size<Px> {
 ///
 /// A `WindowTarget` as a whole is therefore not `Send`. For the owned case the
 /// renderer should take the `Arc<Window>` directly instead: that *is*
-/// `Send + Sync + 'static`, which is what wgpu's safe surface constructor
-/// wants.
+/// `Send + Sync + 'static`, which is what the Skia renderer's software
+/// presenter wants.
 #[derive(Clone, Debug)]
 pub enum WindowTarget {
     /// A window SphereKit created and owns.
