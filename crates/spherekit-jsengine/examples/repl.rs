@@ -1,4 +1,4 @@
-//! Evaluates a JavaScript file with the bundled V8 engine.
+//! Evaluates a JavaScript file with the embedded V8 engine.
 //!
 //! Useful as the smallest possible embedder: it does exactly what a real host
 //! does per frame — evaluate, then drain microtasks and platform tasks — so a
@@ -8,7 +8,6 @@
 //! cargo run -p spherekit-jsengine --example repl -- crates/spherekit-jsengine/test/welcome.js
 //! ```
 
-#[cfg(windows)]
 fn main() -> std::process::ExitCode {
     use spherekit_jsengine::{Engine, Error};
     use std::process::ExitCode;
@@ -63,9 +62,4 @@ fn main() -> std::process::ExitCode {
             ExitCode::FAILURE
         }
     }
-}
-
-#[cfg(not(windows))]
-fn main() {
-    eprintln!("spherekit-jsengine currently supports Windows x86_64 only");
 }

@@ -970,7 +970,6 @@ pub(crate) fn draw_centered(
         &layout,
         origin,
         color,
-        spherekit_render::TextRasterMode::Auto,
         (Px::ZERO, Color::TRANSPARENT),
         spherekit_render::coverage_contrast_for(color, cx.theme.colors.surface),
     );

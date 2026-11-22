@@ -234,6 +234,40 @@ pub fn fallback_families(bucket: FallbackBucket) -> &'static [&'static str] {
 }
 
 /// A loaded face: its bytes, plus everything we want O(1) access to.
+/// Where a loaded face's bytes live. See [`FontDatabase::face_source`].
+#[derive(Clone)]
+pub enum FaceSource {
+    /// A font file on disk.
+    File {
+        /// The file.
+        path: std::path::PathBuf,
+        /// Which face within it; nonzero only for collections.
+        index: u32,
+    },
+    /// A font held in memory.
+    Memory {
+        /// The whole font file.
+        data: Arc<dyn AsRef<[u8]> + Send + Sync>,
+        /// Which face within it; nonzero only for collections.
+        index: u32,
+    },
+}
+
+impl core::fmt::Debug for FaceSource {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            FaceSource::File { path, index } => {
+                f.debug_struct("File").field("path", path).field("index", index).finish()
+            }
+            FaceSource::Memory { data, index } => f
+                .debug_struct("Memory")
+                .field("bytes", &data.as_ref().as_ref().len())
+                .field("index", index)
+                .finish(),
+        }
+    }
+}
+
 struct FaceEntry {
     /// The whole font *file* (not just this face), kept alive for as long as
     /// the entry exists so that borrowed faces can be re-created on demand.
@@ -515,6 +549,26 @@ impl FontDatabase {
             self.with_face(font, |face| crate::hint::VerticalZones::from_face(face)).flatten();
         self.zones.insert(font, measured);
         measured
+    }
+
+    /// Where a face's bytes come from, for a platform rasteriser that loads
+    /// fonts itself.
+    ///
+    /// A file-backed face is reported by path so the rasteriser can map the
+    /// file on its own terms instead of receiving a second copy of it — the
+    /// system CJK collections run to tens of megabytes each. Everything else is
+    /// handed over as the shared bytes this database already holds.
+    pub fn face_source(&self, font: FontId) -> Option<FaceSource> {
+        let entry = self.faces.get(font)?;
+        let path = match self.db.face_source(entry.source) {
+            Some((fontdb::Source::File(path), _)) => Some(path),
+            Some((fontdb::Source::SharedFile(path, _), _)) => Some(path),
+            _ => None,
+        };
+        Some(match path {
+            Some(path) => FaceSource::File { path, index: entry.index },
+            None => FaceSource::Memory { data: entry.data.clone(), index: entry.index },
+        })
     }
 
     /// The face's primary family name.

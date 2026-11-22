@@ -10,7 +10,19 @@ cargo test -p spherekit-bridge --features v8
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 cargo clippy -p spherekit-platform --no-default-features --all-targets -- -D warnings
+
+# Renderers: pixel suites for both backends (D3D11 uses WARP without a GPU),
+# the Skia frame benchmark, and an offscreen PNG of a real interface.
+cargo test -p spherekit-d3d11 -p spherekit-skia -- --nocapture
+cargo test -p spherekit-skia --release --test bench -- --ignored --nocapture
+cargo run -p spherekit --example screenshot --release -- out.png
 ```
+
+`SPHEREKIT_BACKEND=d3d11|skia|auto` forces a renderer for any app or example;
+`SPHEREKIT_SCALE` and `SPHEREKIT_RASTER=outline` are understood by the
+screenshot example. Changing an HLSL file needs no extra step: `build.rs`
+recompiles it, and `every_shader_compiles_from_source` fails if the embedded
+bytecode is stale.
 
 ```bash
 bun install                                  # at the repo root, always
@@ -87,7 +99,7 @@ problem that was somewhere else.
 
 ## Publishing
 
-- crates.io: 16 crates, version in the workspace `[workspace.package]` and
+- crates.io: every workspace crate, version in the workspace `[workspace.package]` and
   mirrored in every `[workspace.dependencies]` entry. `cargo publish
   --workspace` handles ordering.
 - npm: `@spherekit/react`. `prepack` runs the build; `exports` point at `dist/`,

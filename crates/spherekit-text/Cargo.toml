@@ -1,13 +1,13 @@
 [package]
 name = "spherekit-text"
-description = "Font loading, shaping and MTSDF glyph rendering for SphereKit."
+description = "Font loading, shaping and glyph rasterisation (DirectWrite on Windows) for SphereKit."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-keywords = ["text", "font", "shaping", "mtsdf", "glyph"]
+keywords = ["text", "font", "shaping", "directwrite", "glyph"]
 categories = ["graphics", "text-processing"]
 
 [dependencies]
@@ -38,3 +38,5 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_Gdi",
 ] }
+# DirectWrite, the default glyph rasteriser on Windows; see `dwrite`.
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_Graphics_DirectWrite"] }

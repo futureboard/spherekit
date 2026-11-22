@@ -50,9 +50,15 @@ meters ignore the volume control entirely.
 
 ## Text
 
-Glyphs are MTSDF distance fields, rasterised once and sampled at any size, so
-zooming a panel re-rasterises nothing. Below a physical-size threshold an
-analytic-coverage bitmap rasteriser takes over.
+Every glyph is a coverage bitmap rasterised at its exact device size and one
+of four quarter-pixel phases, grayscale or RGB subpixel, and cached in the
+atlas. On Windows DirectWrite rasterises it (`GlyphRasterizer::Platform`, the
+default); elsewhere, or when DirectWrite cannot load a face, the portable
+outline rasteriser with vertical grid fitting does
+(`GlyphRasterizer::Outline`, settable with `TextSystem::set_rasterizer`).
+Text under a scaling transform is a resampled bitmap, not a re-rasterised one,
+so change the font size rather than the transform for text that stays zoomed.
+`Label::outline` is a halo: the run stamped eight times around a circle.
 
 Shaping is rustybuzz. Runs are split by script, bidi level **and font**, and a
 Common/Inherited character stays on the run's current font — which is what stops

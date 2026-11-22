@@ -35,7 +35,6 @@ use crate::style::{Cursor, FocusRing, PaintStyle};
 use crate::theme::Theme;
 use spherekit_core::{Color, Corners, ElementId, Point, Px, Rect, Size, px, relative};
 use spherekit_layout::Style;
-use spherekit_render::TextRasterMode;
 use spherekit_text::{TextLayout, TextStyle, TextSystem, WrapMode};
 
 /// Horizontal padding inside the field's box.
@@ -424,7 +423,6 @@ impl Element for TextField {
                     &layout,
                     Point::new(inner.min_x(), top),
                     c.text_muted,
-                    TextRasterMode::Auto,
                     (Px::ZERO, Color::TRANSPARENT),
                     spherekit_render::coverage_contrast_for(c.text_muted, c.background),
                 );
@@ -466,7 +464,6 @@ impl Element for TextField {
             &layout,
             origin,
             if self.disabled { c.text_muted } else { c.text },
-            TextRasterMode::Auto,
             (Px::ZERO, Color::TRANSPARENT),
             spherekit_render::coverage_contrast_for(
                 if self.disabled { c.text_muted } else { c.text },

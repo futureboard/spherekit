@@ -11,8 +11,8 @@
 //!
 //! # Why one page set per format
 //!
-//! An MTSDF glyph is RGBA8 and a small-size bitmap fallback glyph is R8. Those
-//! are different GPU texture formats, so they cannot share a page no matter how
+//! A grayscale glyph is R8, an RGB subpixel glyph is RGB8 and a colour glyph is
+//! RGBA8. Those are different texture formats, so they cannot share a page no matter how
 //! much free space the other one has. [`GlyphAtlas`] therefore keeps an
 //! independent page list per [`GlyphFormat`]; `max_pages_per_format` is a
 //! per-format limit, and [`AtlasStats::pages`] counts them all.
@@ -53,9 +53,8 @@
 //! not the centre of its first and last texels. This is the convention that
 //! makes a quad covering exactly `w` device pixels sample texel centres: pixel
 //! `i` of that quad interpolates to `(x + i + 0.5) / page`, which is exactly
-//! [`texel_center_uv`]. Half-texel-inset UVs would instead squeeze the field by
-//! one texel, which for a distance field also shifts the distance-to-em mapping
-//! and thins every stem slightly. See [`uv_rect`].
+//! [`texel_center_uv`]. Half-texel-inset UVs would instead squeeze the bitmap
+//! by one texel and resample every glyph slightly blurred. See [`uv_rect`].
 //!
 //! # Uploads
 //!
@@ -105,15 +104,14 @@ const MAX_PAGE_SIZE: u32 = 16384;
 const MAX_DIRTY_BANDS: usize = 16;
 
 /// Number of distinct [`GlyphFormat`] page sets.
-const FORMAT_COUNT: usize = 4;
+const FORMAT_COUNT: usize = 3;
 
 #[inline]
 fn format_index(f: GlyphFormat) -> usize {
     match f {
-        GlyphFormat::Mtsdf => 0,
-        GlyphFormat::Grayscale => 1,
-        GlyphFormat::Subpixel => 2,
-        GlyphFormat::ColorBitmap => 3,
+        GlyphFormat::Grayscale => 0,
+        GlyphFormat::Subpixel => 1,
+        GlyphFormat::ColorBitmap => 2,
     }
 }
 
@@ -590,7 +588,7 @@ impl GlyphAtlas {
         Self {
             config: config.sanitized(),
             pages: Vec::new(),
-            sets: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+            sets: [Vec::new(), Vec::new(), Vec::new()],
             residency: FxHashMap::default(),
             frame: 0,
             generation: 0,
@@ -752,7 +750,6 @@ impl GlyphAtlas {
                 uv: [0.0; 4],
                 texels: rect(0, 0, 0, 0),
                 bounds_em: image.bounds_em,
-                range_em: image.range_em,
                 format: image.format,
             };
             self.residency.insert(key, Resident { placement, last_used_frame: self.frame });
@@ -806,7 +803,6 @@ impl GlyphAtlas {
             uv: uv_rect(self.config.page_size, texels),
             texels,
             bounds_em: image.bounds_em,
-            range_em: image.range_em,
             format: image.format,
         };
         self.residency.insert(key, Resident { placement, last_used_frame: frame });
@@ -1026,7 +1022,6 @@ impl GlyphAtlas {
             w: u32,
             h: u32,
             bounds_em: Rect<f32>,
-            range_em: f32,
             last_used_frame: u64,
             data: Vec<u8>,
         }
@@ -1059,7 +1054,6 @@ impl GlyphAtlas {
                 w: w as u32,
                 h: h as u32,
                 bounds_em: r.placement.bounds_em,
-                range_em: r.placement.range_em,
                 last_used_frame: r.last_used_frame,
                 data,
             });
@@ -1106,7 +1100,6 @@ impl GlyphAtlas {
                         uv: uv_rect(self.config.page_size, texels),
                         texels,
                         bounds_em: g.bounds_em,
-                        range_em: g.range_em,
                         format: g.format,
                     },
                     last_used_frame: g.last_used_frame,
@@ -1243,7 +1236,7 @@ mod tests {
     use spherekit_core::{FontId, GlyphId};
 
     fn key(n: u16) -> GlyphKey {
-        GlyphKey::mtsdf(FontId::new(0, 1), GlyphId(n), 0)
+        GlyphKey::bitmap(FontId::new(0, 1), GlyphId(n), 0, 16)
     }
 
     /// A glyph image of `w x h` filled with `fill`, in the given format.
@@ -1254,7 +1247,6 @@ mod tests {
             format,
             data: vec![fill; (w * h) as usize * format.bytes_per_pixel()],
             bounds_em: rect(0.0, -0.7, 0.5, 0.7),
-            range_em: 0.05,
         }
     }
 
@@ -1404,7 +1396,6 @@ mod tests {
             format: GlyphFormat::Grayscale,
             data: vec![0; 4],
             bounds_em: rect(0.0, 0.0, 0.0, 0.0),
-            range_em: 0.0,
         };
         // Reported as malformed data rather than accepted: the declared size and
         // the buffer disagree, which is the first thing worth catching.
@@ -1453,13 +1444,13 @@ mod tests {
     fn separate_formats_never_share_a_page() {
         let mut atlas = small_atlas(64, 4);
         let a = atlas.insert(key(0), &gray(8, 8)).expect("fits");
-        let b = atlas.insert(key(1), &img(8, 8, GlyphFormat::Mtsdf, 0x11)).expect("fits");
+        let b = atlas.insert(key(1), &img(8, 8, GlyphFormat::ColorBitmap, 0x11)).expect("fits");
         let c = atlas.insert(key(2), &img(8, 8, GlyphFormat::Subpixel, 0x22)).expect("fits");
         assert_ne!(a.page, b.page, "an R8 and an RGBA8 glyph cannot share storage");
         assert_ne!(a.page, c.page, "an R8 and an RGB8 glyph cannot share storage");
         assert_ne!(b.page, c.page, "an RGBA8 and an RGB8 glyph cannot share storage");
         assert_eq!(atlas.page_format(a.page), Some(GlyphFormat::Grayscale));
-        assert_eq!(atlas.page_format(b.page), Some(GlyphFormat::Mtsdf));
+        assert_eq!(atlas.page_format(b.page), Some(GlyphFormat::ColorBitmap));
         assert_eq!(atlas.page_format(c.page), Some(GlyphFormat::Subpixel));
         assert_eq!(atlas.page_pixels(c.page).unwrap().len(), 64 * 64 * 3);
         // The per-format limit is per-format, so both sets can be full at once.
@@ -1504,7 +1495,6 @@ mod tests {
             format: GlyphFormat::Grayscale,
             data: vec![1, 2, 3, 4],
             bounds_em: rect(0.0, 0.0, 0.1, 0.1),
-            range_em: 0.0,
         };
         let p = atlas.insert(key(1), &probe).expect("fits");
         let px = atlas.page_pixels(p.page).expect("mirror exists");
@@ -1642,7 +1632,6 @@ mod tests {
             format: GlyphFormat::Grayscale,
             data: vec![0; 10], // needs 64
             bounds_em: rect(0.0, 0.0, 0.1, 0.1),
-            range_em: 0.0,
         };
         let err = atlas.insert(key(0), &bad).unwrap_err();
         assert!(matches!(err, FontError::Parse { .. }), "{err:?}");
@@ -1988,7 +1977,7 @@ mod tests {
         assert!(c.padding <= MIN_PAGE_SIZE / 4);
         // A larger limit does not inflate the requested size.
         assert_eq!(AtlasConfig::default().clamped_to_device(16384).page_size, 2048);
-        assert_eq!(AtlasConfig::default().page_bytes(GlyphFormat::Mtsdf), 2048 * 2048 * 4);
+        assert_eq!(AtlasConfig::default().page_bytes(GlyphFormat::ColorBitmap), 2048 * 2048 * 4);
         assert_eq!(AtlasConfig::default().page_bytes(GlyphFormat::Grayscale), 2048 * 2048);
         assert_eq!(AtlasConfig::default().page_bytes(GlyphFormat::Subpixel), 2048 * 2048 * 3);
     }
@@ -1999,7 +1988,7 @@ mod tests {
         // config nothing sanitised: u32::MAX squared times four bytes overflows
         // usize on every target and used to panic in debug.
         let raw = AtlasConfig { page_size: u32::MAX, ..AtlasConfig::default() };
-        assert_eq!(raw.page_bytes(GlyphFormat::Mtsdf), usize::MAX);
+        assert_eq!(raw.page_bytes(GlyphFormat::ColorBitmap), usize::MAX);
         assert_eq!(raw.page_bytes(GlyphFormat::Grayscale), u32::MAX as usize * u32::MAX as usize);
 
         // ...and an atlas built from it clamps to something a backend can make,

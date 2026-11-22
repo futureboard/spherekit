@@ -1926,7 +1926,6 @@ impl Element for MenuItem {
             &layout,
             Point::new(inner.min_x(), baseline),
             ink,
-            spherekit_render::TextRasterMode::Auto,
             (Px::ZERO, Color::TRANSPARENT),
             spherekit_render::coverage_contrast_for(ink, c.surface),
         );
@@ -1940,7 +1939,6 @@ impl Element for MenuItem {
                 &s,
                 Point::new(x, y),
                 c.text_muted,
-                spherekit_render::TextRasterMode::Auto,
                 (Px::ZERO, Color::TRANSPARENT),
                 spherekit_render::coverage_contrast_for(c.text_muted, c.surface),
             );
@@ -2311,7 +2309,6 @@ impl Element for Avatar {
                 &layout,
                 origin,
                 ink,
-                spherekit_render::TextRasterMode::Auto,
                 (Px::ZERO, Color::TRANSPARENT),
                 spherekit_render::coverage_contrast_for(ink, fill),
             );

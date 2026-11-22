@@ -1,16 +1,18 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useState } from "react";
 import {
   Button,
-  Knob,
-  Progress,
-  Separator,
-  Slider,
   Text,
-  Toggle,
   View,
   cx,
+  useInvoke,
+  useNativeEvent,
   type SphereKitApiBridge,
 } from "@spherekit/react";
+import { Events, Methods, type AppInfo, type FrameEvent } from "./native";
+import { About } from "./pages/About";
+import { Mixer } from "./pages/Mixer";
+import { Tasks } from "./pages/Tasks";
+import { Team } from "./pages/Team";
 
 /** Everything the app needs from the native side. */
 export interface AppProps {
@@ -18,86 +20,75 @@ export interface AppProps {
   readonly bridge: SphereKitApiBridge;
 }
 
+const PAGES = [
+  { key: "mixer", title: "Mixer" },
+  { key: "tasks", title: "Tasks" },
+  { key: "team", title: "Team" },
+  { key: "about", title: "About" },
+] as const;
+
+type PageKey = (typeof PAGES)[number]["key"];
+
 /**
- * The demo application.
+ * SphereKit Studio: the demo application.
  *
- * Deliberately ordinary React: hooks, derived values, callbacks. Nothing here
- * knows it is driving a GPU renderer rather than a DOM — that is the point.
- * The only SphereKit-specific concepts are the host components and the
- * `bridge`, and the bridge is only used for the two things the DOM has no
- * equivalent for: calling a native method, and receiving a native event.
+ * Deliberately ordinary React — hooks, derived state, controlled inputs,
+ * conditional rendering, lists with keys. Nothing here knows it is driving a
+ * native renderer rather than a DOM; that is the point. The SphereKit-specific
+ * parts are the host components and the bridge, used for the three things the
+ * DOM has no equivalent for: native events (`frame`, `meters`), native method
+ * calls (`app.info`, `app.setAnimating`, `app.quit`), and a stylesheet shared
+ * with native code.
  */
 export function App({ bridge }: AppProps) {
-  const [gain, setGain] = useState(0.72);
-  const [tone, setTone] = useState(0.4);
-  const [live, setLive] = useState(true);
-  const [presses, setPresses] = useState(0);
-  const [frames, setFrames] = useState(0);
+  const [page, setPage] = useState<PageKey>("mixer");
+  const [frame, setFrame] = useState<FrameEvent>({ count: 0, fps: 0, cpuMs: 0 });
+  const info = useInvoke<AppInfo>(bridge, Methods.info);
 
-  // A native event that no React component raised: the Rust side emits a
-  // `frame` event every render, and the header counts them. This is the
-  // native -> JavaScript direction of the bridge.
-  useEffect(() => bridge.on<{ count: number }>("frame", (p) => setFrames(p.count)), [bridge]);
-
-  const decibels = useMemo(() => (gain <= 0 ? "-inf" : (20 * Math.log10(gain)).toFixed(1)), [gain]);
-
-  const reset = useCallback(() => {
-    setGain(0.72);
-    setTone(0.4);
-    setPresses((n) => n + 1);
-  }, []);
+  useNativeEvent<FrameEvent>(bridge, Events.frame, setFrame);
+  // Native code can drive navigation too — a menu, a shortcut, or the
+  // headless `--screenshot --page` mode in `src/main.rs`.
+  useNativeEvent<{ page: string }>(bridge, Events.navigate, ({ page: next }) => {
+    if (PAGES.some((p) => p.key === next)) setPage(next as PageKey);
+  });
 
   return (
     <View className="root">
-      <View className="header">
-        <View>
-          <Text className="title">SphereKit React</Text>
-          <Text className="subtitle">React 19 in V8, rendered on the GPU</Text>
+      <View className="sidebar">
+        <View className="brand">
+          <Text className="brand-title">SphereKit</Text>
+          <Text className="brand-subtitle">Studio</Text>
         </View>
-        <Text className="subtitle">{`frame ${frames}`}</Text>
-      </View>
-
-      <View className={cx("card", "telemetry")}>
-        <View className="row">
-          <Text className="label">OUTPUT GAIN</Text>
-          <View className="grow" />
-          <View className="meter">
-            <Text className="value">{`${decibels} dB`}</Text>
-          </View>
-        </View>
-        <Slider
-          value={gain}
-          minimumValue={0}
-          maximumValue={1}
-          step={0.001}
-          onValueChange={setGain}
-        />
-        <Progress value={gain} />
-      </View>
-
-      <View className="card">
-        <Text className="label">TONE</Text>
-        <View className="row">
-          <Knob value={tone} minimumValue={0} maximumValue={1} onValueChange={setTone} />
-          <Text className="value">{tone.toFixed(2)}</Text>
-          <View className="grow" />
-          <Toggle checked={live} label="Live" onChange={setLive} />
-        </View>
-      </View>
-
-      <Separator />
-
-      <View className="row">
-        <Button className="primary" title="Reset" onPress={reset} />
-        <Button title={`Pressed ${presses}`} disabled={presses === 0} onPress={() => {}} />
+        {PAGES.map((p) => (
+          <Button
+            key={p.key}
+            className={cx("nav", page === p.key && "selected")}
+            title={p.title}
+            onPress={() => setPage(p.key)}
+          />
+        ))}
         <View className="grow" />
-        <Button
-          className="danger"
-          title="Quit"
-          onPress={() => {
-            void bridge.invoke("app.quit");
-          }}
-        />
+        <View className="badge">
+          <Text className="badge-text">{info.data ? info.data.backend : "…"}</Text>
+        </View>
+      </View>
+
+      <View className="main">
+        <View className="header">
+          <View className="heading">
+            <Text className="title">{PAGES.find((p) => p.key === page)?.title ?? ""}</Text>
+            <Text className="subtitle">React 19 in V8 · rendered natively</Text>
+          </View>
+          <View className="grow" />
+          <Text className="stat">{`${frame.fps.toFixed(0)} fps`}</Text>
+          <Text className="stat">{`${frame.cpuMs.toFixed(2)} ms cpu`}</Text>
+          <Text className="stat">{`frame ${frame.count}`}</Text>
+        </View>
+
+        {page === "mixer" && <Mixer bridge={bridge} />}
+        {page === "tasks" && <Tasks />}
+        {page === "team" && <Team />}
+        {page === "about" && <About bridge={bridge} />}
       </View>
     </View>
   );

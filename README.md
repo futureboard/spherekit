@@ -5,8 +5,9 @@
 # SphereKit
 
 > SphereKit is a GPU-first graphics and UI engine written in Rust for realtime creative
-> applications. It combines a retained node/layout architecture, a WGPU rendering pipeline,
-> GPU-native MTSDF text, and specialised realtime visualisation primitives for audio software.
+> applications. It combines a retained node/layout architecture, a Direct3D 11 renderer with a Skia
+> CPU fallback, pixel-fitted bitmap text, and specialised realtime visualisation primitives for audio
+> software.
 
 **Status: v0.1, in development. Not production ready.**
 
@@ -39,24 +40,23 @@ backend.render(&mut handle, frame, Color::hex(0x101214))?;
 `PAINT` dirty. Nothing above it relays out, no text reshapes, and no unrelated widget is touched.
 This is enforced by the dirty-flag propagation rules, and it is tested rather than asserted.
 
-**Text is a distance field, not a bitmap cache.** Glyphs are rasterised once into a multi-channel
-signed distance field with a fourth true-distance channel (MTSDF), then sampled at any size.
-Zooming a panel does not re-rasterise anything, and outlines, glows and shadows come from the same
-field with no second pass. Below twenty-four device pixels — where a distance field runs out of
-resolution before a glyph runs out of detail — an isolated bitmap fallback takes over, vertically
-grid-fitted and positioned to a quarter pixel, which is what keeps interface labels crisp at 100 %
-scaling. The threshold is on _device_ pixels, so a 13 px label is a bitmap at 100 % and a distance
-field at 200 %.
+**Text is rasterised for the pixels it lands on.** Every glyph is a coverage bitmap at its exact
+device size and one of four quarter-pixel phases, grayscale or RGB subpixel, cached in a paged
+atlas. On Windows the bitmaps come from DirectWrite, so text matches every other application on the
+desktop; elsewhere a pure-Rust exact-area rasteriser with vertical grid fitting produces them.
+Shaping and layout stay in SphereKit on every platform, so a layout measures the same whichever
+rasteriser draws it — and because the renderer only ever tints a bitmap, the CPU backend draws text
+as cheaply as the GPU one.
 
 **Realtime audio data never renders from the audio thread.** The boundary is a lock-free snapshot
 or ring buffer. Everything on the far side of it — allocation, GPU upload, text shaping, file I/O —
 is forbidden on the audio callback, and the architecture documents say so in the place you would
 look before breaking it.
 
-**Vector paths are antialiased too.** Rectangles, rounded rectangles and glyphs are smoothed
-analytically by their own shaders. A tessellated path has no analytic edge at all, so the surface
-and every offscreen layer are multisampled 4× — that is what keeps SVG icons, EQ curves and waveform
-outlines from looking jagged.
+**Vector paths are antialiased too.** Rectangles and rounded rectangles are smoothed analytically by
+their own shaders, and glyphs carry their antialiasing in the bitmap. A tessellated path has no
+analytic edge at all, so on the GPU the surface and every offscreen layer are multisampled 4× — that
+is what keeps SVG icons, EQ curves and waveform outlines from looking jagged.
 
 **Colour is linear, and that is not optional.** `Color` is sRGB with straight alpha; `LinearColor`
 is linear-light and premultiplied and is what reaches the GPU. Mixing happens in linear space, so a
@@ -97,9 +97,9 @@ lowered to native widgets through that same cascade. Events come back by node id
 no IPC. The isolate lives on the UI thread in the renderer's address space, so a native call from
 JavaScript is synchronous and an `invoke()` from a React effect can settle inside the same commit
 that made it. The isolate's microtask policy is explicit, so queued JavaScript runs at the two points
-in the frame the host picks and nowhere else — never in the middle of a layout pass. The V8 prebuilt
-is Windows x86_64 today; everywhere else the same protocol is driven from a WebView or a child
-process.
+in the frame the host picks and nowhere else — never in the middle of a layout pass. V8 comes from
+rusty_v8's prebuilt static libraries (Windows, Linux, macOS); the same protocol can also be driven
+from a WebView or a child process.
 
 ## Widgets
 
@@ -168,10 +168,9 @@ spherekit-ui           element tree, events, focus, widgets
 spherekit-layout       retained nodes, styles, dirty propagation, hit testing
     ↓
 spherekit-render       canvas → scene → cull → batch → CompiledFrame
-    ↓
-spherekit-wgpu         the only crate that knows wgpu exists
-    ↓
-D3D12 / Vulkan / Metal / WebGPU
+    ↓                               ↓
+spherekit-d3d11                  spherekit-skia
+Direct3D 11, DirectComposition   Skia on the CPU, softbuffer
 ```
 
 Both entry paths converge at `spherekit-ui`, and nothing below it can tell which one it came from.
@@ -180,8 +179,9 @@ Both entry paths converge at `spherekit-ui`, and nothing below it can tell which
 | -------------------- | ------------------------------------------------------------------- |
 | `spherekit-core`     | Units, geometry, transforms, colour, paths, paint, identity, errors |
 | `spherekit-render`   | Canvas, display list, culling, batching, tessellation, backend seam |
-| `spherekit-wgpu`     | wgpu backend, WGSL shaders, pipeline cache, GPU buffers             |
-| `spherekit-text`     | Font discovery, shaping, line layout, MTSDF generation, paged atlas |
+| `spherekit-d3d11`    | Direct3D 11 backend: precompiled HLSL, DirectComposition swap chain |
+| `spherekit-skia`     | Skia CPU backend, presented with `softbuffer`                       |
+| `spherekit-text`     | Font discovery, shaping, line layout, glyph rasterisation, atlas    |
 | `spherekit-layout`   | Retained layout tree, style, dirty flags, hit testing, scrolling    |
 | `spherekit-image`    | Image decoding, texture cache, fit resolution                       |
 | `spherekit-svg`      | SVG parsing and cached tessellation for interface assets            |
@@ -197,17 +197,28 @@ Both entry paths converge at `spherekit-ui`, and nothing below it can tell which
 | `spherekit-cli`      | `spherekit` command: scaffolds and builds React + Rust apps         |
 | `spherekit`          | Facade that re-exports the whole engine                             |
 
-Backend mapping: Windows → Direct3D 12, Linux → Vulkan, macOS → Metal, Web → WebGPU.
+Backend mapping: Windows → Direct3D 11 (feature level 11_0), falling back to Skia on the CPU when
+there is no hardware device; Linux and macOS → Skia. `SurfaceOptions::backend` chooses, and
+`SPHEREKIT_BACKEND=d3d11|skia|auto` overrides it for diagnostics without a rebuild.
 
-> **Transparent windows are Direct3D 12 only.** A transparent surface is composited through a
-> DirectComposition visual, which is the DX12 presentation path; NVIDIA's Windows Vulkan WSI
-> exposes `Opaque` alpha and nothing else, so a Mica window on Vulkan renders as a black
-> rectangle. `spherekit-wgpu` forces DX12 for transparent surfaces and says so in the log.
-> `WGPU_BACKEND` still overrides it for diagnostics.
+> **Transparent windows need Direct3D 11.** Every Direct3D 11 window presents through a
+> DirectComposition visual, which is what gives per-pixel alpha (Mica, Acrylic, rounded
+> translucent panels). The Skia backend presents through `softbuffer`, which blits opaque pixels
+> only, so a transparent window it renders comes out opaque.
 
 ## Building
 
 Requires Rust 1.87 or newer (edition 2024).
+
+`skia-safe` downloads a prebuilt Skia on first build; nothing needs compiling from C++. On Linux the
+prebuilt links against the system fontconfig and FreeType (`libfontconfig1-dev libfreetype6-dev` on
+Debian/Ubuntu). The Direct3D 11 shaders are compiled to bytecode by `build.rs` with the
+`d3dcompiler_47.dll` that ships with Windows.
+
+`tools/bootstrap.ps1` downloads pinned LLVM, CMake and Ninja into a git-ignored `.bin/` and writes
+`.bin/env.ps1`. A normal build does not need it; it exists for building Skia from source, which
+only happens if the `skia-safe` feature set in the root `Cargo.toml` is changed to one rust-skia
+publishes no binaries for.
 
 ```bash
 cargo build --workspace
@@ -231,7 +242,7 @@ directory ... Access is denied (os error 5)`. Set `CARGO_INCREMENTAL=0` for the 
 ### Quickstart: the React example app
 
 `app/reactdemo` is React 19 in SphereKit's own V8 isolate, styled by the shared CSS runtime,
-rendered on the GPU:
+rendered through the same backends as everything else:
 
 ```bash
 cargo run -p reactdemo --release
@@ -250,8 +261,8 @@ cargo run -p reactdemo --release
 The status bar at the bottom of that window is a native `div()` no React component knows exists, and
 it is resolved through the very same stylesheet rules. One cascade, two producers, no browser.
 
-The `v8` feature is off by default everywhere, including on the facade, because the prebuilt is a
-~100 MB Windows x86_64 download. `cargo build -p spherekit --features v8` opts in.
+The `v8` feature is off by default everywhere, including on the facade, because rusty_v8 downloads a
+~230 MB prebuilt static V8 on first build. `cargo build -p spherekit --features v8` opts in.
 
 ```bash
 cargo run -p spherekit-bridge --features v8 --example js_roundtrip   # the whole path, no bundler
@@ -290,7 +301,8 @@ the V8 embedding.
 
 ## Status
 
-Measured on an NVIDIA GTX 1060 (Vulkan), running
+Measured on an NVIDIA GTX 1060 (then through wgpu on Vulkan, before the Direct3D 11 and Skia
+backends replaced it; not yet re-measured), running
 `cargo run -p spherekit --example plugin_ui_demo --release` for 180 frames:
 
 |                               |                                                             |
@@ -315,12 +327,11 @@ cargo run -p spherekit --example desktop_app    --release  # borderless, custom 
 cargo run -p spherekit --example system_window  --release  # the platform draws the title bar
 cargo run -p spherekit --example plugin_ui_demo --release  # a compressor plug-in editor
 
-# Diagnostic: writes a side-by-side PNG of one line of text, distance field
-# against whatever the automatic strategy picks, and reports why.
-SPHEREKIT_PROBE_SIZE=13 SPHEREKIT_PROBE_ZOOM=4 cargo run -p spherekit-text --example glyph_quad_probe --release -- out.png
-
-# The same probe with RGB coverage off, which is what a transparent window gets.
-SPHEREKIT_PROBE_SUBPIXEL=0 SPHEREKIT_PROBE_SIZE=10 cargo run -p spherekit-text --example glyph_quad_probe --release
+# Diagnostic: renders a small interface offscreen and writes a PNG, through whichever
+# backend is chosen. SPHEREKIT_SCALE sets the scale factor; SPHEREKIT_RASTER=outline
+# swaps DirectWrite for the portable rasteriser.
+cargo run -p spherekit --example screenshot --release -- out.png
+SPHEREKIT_BACKEND=skia cargo run -p spherekit --example screenshot --release -- skia.png
 ```
 
 **`app/uigallery`** is the reference application: a home page and ten catalogue pages under a custom
@@ -348,8 +359,8 @@ measured, which makes them usable as smoke tests.
 | Document                                         | Contents                                                                |
 | ------------------------------------------------ | ----------------------------------------------------------------------- |
 | [`docs/architecture.md`](docs/architecture.md)   | Crate boundaries, the frame lifecycle, why the seams are where they are |
-| [`docs/rendering.md`](docs/rendering.md)         | Scene, culling, batching, the instance layouts, shaders, colour         |
-| [`docs/text.md`](docs/text.md)                   | Shaping, MTSDF, the atlas, and the small-text policy                    |
+| [`docs/rendering.md`](docs/rendering.md)         | Scene, culling, batching, instance layouts, the two backends, colour    |
+| [`docs/text.md`](docs/text.md)                   | Shaping, glyph rasterisation, grid fitting, the atlas, text contrast    |
 | [`docs/layout.md`](docs/layout.md)               | The retained tree, dirty propagation, hit testing                       |
 | [`docs/audio-ui.md`](docs/audio-ui.md)           | The audio-thread boundary and realtime primitives                       |
 | [`docs/platform.md`](docs/platform.md)           | Windowing, HiDPI, plug-in embedding, frame scheduling                   |

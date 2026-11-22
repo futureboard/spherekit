@@ -1,6 +1,6 @@
 //! # SphereKit
 //!
-//! A GPU-first graphics and UI engine written in Rust for realtime creative
+//! A graphics and UI engine written in Rust for realtime creative
 //! applications: digital audio workstations, audio plug-ins, creative tools and
 //! visualisation.
 //!
@@ -14,9 +14,13 @@
 //!     -> spherekit-ui         elements, events, focus, widgets
 //!     -> spherekit-layout     retained nodes, style, dirty flags, hit testing
 //!     -> spherekit-render     canvas, scene, culling, batching
-//!     -> spherekit-wgpu       the only crate that knows wgpu exists
-//!     -> D3D12 / Vulkan / Metal / WebGPU
+//!     -> spherekit-d3d11      Direct3D 11 + DirectComposition (Windows, GPU)
+//!        spherekit-skia       Skia raster (every platform, CPU fallback)
 //! ```
+//!
+//! Text is shaped by SphereKit and rasterised by DirectWrite on Windows (or the
+//! built-in outline rasteriser elsewhere) into a coverage atlas both renderers
+//! sample.
 //!
 //! An application written in TypeScript enters one layer higher up, and the
 //! rest of the stack cannot tell the difference:
@@ -72,8 +76,11 @@
 //!
 //! * **Paint-only updates cost no layout.** A meter repainting sixty times a
 //!   second marks `PAINT`; nothing relayouts and no text reshapes.
-//! * **Text is a distance field.** Glyphs are rasterised once and sampled at any
-//!   size, so zooming a panel re-rasterises nothing.
+//! * **Text looks native.** On Windows glyphs come from DirectWrite, so they
+//!   match the rest of the desktop, ClearType included; each size is
+//!   rasterised once and cached.
+//! * **No GPU is required.** Without a usable Direct3D 11 device the same
+//!   frame renders through Skia on the CPU.
 //! * **Realtime audio data never renders from the audio thread.** The boundary
 //!   is a lock-free snapshot or ring; see [`audio`].
 //! * **Colour is linear.** Blending and gradient interpolation happen in linear
@@ -83,10 +90,7 @@
 
 pub mod surface;
 
-pub use surface::{InitTiming, SphereKitSurface, SurfaceOptions, SurfaceStats};
-
-/// Which graphics API a surface renders through.
-pub use spherekit_wgpu::Backend;
+pub use surface::{Backend, InitTiming, SphereKitSurface, SurfaceOptions, SurfaceStats};
 
 /// Realtime audio visualisation and the lock-free audio-thread boundary.
 pub use spherekit_audio_ui as audio;
@@ -96,6 +100,8 @@ pub use spherekit_bridge as bridge;
 pub use spherekit_core as core;
 /// CSS parsing, selector cascade and native style application.
 pub use spherekit_css as css;
+/// The Direct3D 11 renderer. Its constructors fail off Windows.
+pub use spherekit_d3d11 as d3d11;
 /// Image decoding and the texture cache.
 pub use spherekit_image as image;
 /// The embedded V8 engine, behind the `v8` feature.
@@ -113,14 +119,14 @@ pub use spherekit_platform as platform;
 pub use spherekit_react as react;
 /// Canvas, scene, culling, batching and the backend seam.
 pub use spherekit_render as render;
+/// The Skia CPU renderer.
+pub use spherekit_skia as skia;
 /// SVG asset loading.
 pub use spherekit_svg as svg;
-/// Font discovery, shaping, layout and MTSDF glyph rendering.
+/// Font discovery, shaping, layout and glyph rasterisation.
 pub use spherekit_text as text;
 /// Elements, events, focus, theming and widgets.
 pub use spherekit_ui as ui;
-/// The wgpu rendering backend.
-pub use spherekit_wgpu as wgpu_backend;
 
 /// Everything a typical application needs, in one import.
 pub mod prelude {
@@ -187,17 +193,10 @@ mod tests {
     #[cfg(feature = "v8")]
     #[test]
     fn the_v8_feature_reaches_the_engine_and_the_js_bridge() {
-        // Asserted on both sides of the `cfg` rather than only where V8 exists:
-        // the whole point of the stub engine is that a host crate compiles and
-        // *runs* on a target without the prebuilt, refusing at the call instead
-        // of failing to build. A test that only ran on Windows would never
-        // notice that promise breaking.
+        // rusty_v8 ships prebuilts for every desktop target, so V8 is linked
+        // wherever this compiles.
         assert!(size_of::<crate::bridge::JsBridge>() > 0, "the JS host is reachable by name");
-        if cfg!(windows) {
-            assert!(!crate::js::Engine::version().is_empty());
-            assert!(!crate::bridge::v8_version().is_empty());
-        } else {
-            assert_eq!(crate::js::Engine::new().err(), Some(crate::js::Error::UnsupportedPlatform));
-        }
+        assert!(!crate::js::Engine::version().is_empty());
+        assert!(!crate::bridge::v8_version().is_empty());
     }
 }

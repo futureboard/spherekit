@@ -1,7 +1,7 @@
 //! The text system: one object that turns a string into drawable glyphs.
 //!
-//! Everything below this module — font discovery, shaping, line layout, MTSDF
-//! generation, atlas packing — is independently usable. This is the thing you
+//! Everything below this module — font discovery, shaping, line layout, glyph
+//! rasterisation, atlas packing — is independently usable. This is the thing you
 //! actually hold: it owns a font database, an atlas and the caches, and it
 //! implements [`spherekit_render::GlyphProvider`] so the batch compiler can ask it
 //! for glyphs while building a frame.
@@ -27,14 +27,27 @@
 use crate::atlas::{AtlasConfig, AtlasStats, DirtyRegion, GlyphAtlas};
 use crate::cache::{CacheStats, ShapeCache};
 use crate::font::FontDatabase;
-use crate::mtsdf::{GlyphRasterConfig, generate_mtsdf};
 use crate::raster::{
-    RasterStrategy, bitmap_size_px, choose_raster_strategy, rasterize_glyph_subpixel_with_zones,
-    rasterize_glyph_with_zones_at_phase,
+    bitmap_size_px, rasterize_glyph_subpixel_with_zones, rasterize_glyph_with_zones_at_phase,
 };
-use crate::types::{GlyphFormat, GlyphKey, TextLayout, TextStyle};
+use crate::types::{GlyphFormat, GlyphImage, GlyphKey, TextLayout, TextStyle};
 use spherekit_core::{FontId, GlyphId, Px, ScaleFactor};
-use spherekit_render::{GlyphPlacement, GlyphProvider, GlyphRequest, TextRasterMode};
+use spherekit_render::{GlyphPlacement, GlyphProvider, GlyphRequest};
+
+/// Which rasteriser turns glyph outlines into coverage bitmaps.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Default)]
+pub enum GlyphRasterizer {
+    /// The platform's own: DirectWrite on Windows, so text matches every other
+    /// application there. Elsewhere, and for any face DirectWrite cannot load,
+    /// this is the same as [`GlyphRasterizer::Outline`].
+    #[default]
+    Platform,
+    /// SphereKit's portable outline rasteriser on every platform.
+    ///
+    /// Identical output everywhere, which is what pixel tests and
+    /// cross-platform screenshots want.
+    Outline,
+}
 
 /// Counters for the diagnostics overlay.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
@@ -45,12 +58,13 @@ pub struct TextSystemStats {
     pub glyph_misses: u64,
     /// Glyphs that could not be produced at all.
     pub glyph_failures: u64,
-    /// Glyphs rasterised as distance fields.
-    pub mtsdf_glyphs: u64,
-    /// Glyphs rasterised as small-size bitmaps.
+    /// Glyphs rasterised, by any rasteriser.
     pub bitmap_glyphs: u64,
-    /// Bitmap glyphs rasterised as RGB-stripe subpixel coverage.
+    /// Of those, glyphs rasterised as RGB-stripe subpixel coverage.
     pub subpixel_glyphs: u64,
+    /// Of those, glyphs the platform rasteriser (DirectWrite) produced. The
+    /// rest came from the outline rasteriser.
+    pub platform_glyphs: u64,
 }
 
 impl TextSystemStats {
@@ -70,7 +84,11 @@ pub struct TextSystem {
     fonts: FontDatabase,
     atlas: GlyphAtlas,
     shapes: ShapeCache,
-    raster: GlyphRasterConfig,
+    rasterizer: GlyphRasterizer,
+    /// Created on the first glyph, so a system that only measures text never
+    /// starts DirectWrite. `Some(None)` means it was tried and is unavailable.
+    #[cfg(windows)]
+    dwrite: Option<Option<crate::dwrite::DirectWriteRasterizer>>,
     stats: TextSystemStats,
 }
 
@@ -87,7 +105,9 @@ impl TextSystem {
             fonts: FontDatabase::new(),
             atlas: GlyphAtlas::new(),
             shapes: ShapeCache::default(),
-            raster: GlyphRasterConfig::default(),
+            rasterizer: GlyphRasterizer::default(),
+            #[cfg(windows)]
+            dwrite: None,
             stats: TextSystemStats::default(),
         }
     }
@@ -114,16 +134,21 @@ impl TextSystem {
         self.atlas = GlyphAtlas::with_config(config);
     }
 
-    /// Replaces the distance-field rasterisation settings.
+    /// Chooses the glyph rasteriser, discarding every resident glyph.
     ///
-    /// Changing this invalidates every resident distance field, so the atlas is
-    /// cleared: a page holding fields generated at a different range would mix
-    /// two incompatible encodings and render as a mess.
-    pub fn set_raster_config(&mut self, config: GlyphRasterConfig) {
-        if config != self.raster {
-            self.raster = config;
+    /// Bitmaps from two rasterisers differ in hinting and filtering, so mixing
+    /// them in one atlas would put subtly different letters side by side.
+    pub fn set_rasterizer(&mut self, rasterizer: GlyphRasterizer) {
+        if rasterizer != self.rasterizer {
+            self.rasterizer = rasterizer;
             self.atlas = GlyphAtlas::with_config(self.atlas.config());
         }
+    }
+
+    /// The glyph rasteriser in use.
+    #[inline]
+    pub fn rasterizer(&self) -> GlyphRasterizer {
+        self.rasterizer
     }
 
     /// The font database.
@@ -211,16 +236,66 @@ impl TextSystem {
     pub fn clear_caches(&mut self) {
         self.shapes.clear();
         self.atlas = GlyphAtlas::with_config(self.atlas.config());
+        #[cfg(windows)]
+        if let Some(Some(dw)) = &mut self.dwrite {
+            dw.clear();
+        }
         self.stats = TextSystemStats::default();
     }
 
-    /// Decides how a glyph should be rasterised.
-    fn strategy(&self, mode: TextRasterMode, font_size: Px, scale: ScaleFactor) -> RasterStrategy {
-        match mode {
-            TextRasterMode::Mtsdf => RasterStrategy::Mtsdf,
-            TextRasterMode::Bitmap => RasterStrategy::Bitmap,
-            TextRasterMode::Auto => choose_raster_strategy(font_size, scale),
+    /// Rasterises a glyph with the platform rasteriser, if it applies.
+    ///
+    /// `None` means "use the outline rasteriser": not Windows, the outline
+    /// rasteriser was asked for, DirectWrite is unavailable, or it could not
+    /// load this face.
+    #[cfg(windows)]
+    fn rasterize_platform(
+        &mut self,
+        font: FontId,
+        glyph: GlyphId,
+        size_px: f32,
+        format: GlyphFormat,
+        subpixel_phase: u8,
+    ) -> Option<GlyphImage> {
+        if self.rasterizer != GlyphRasterizer::Platform {
+            return None;
         }
+        let dw =
+            self.dwrite.get_or_insert_with(crate::dwrite::DirectWriteRasterizer::new).as_mut()?;
+        dw.rasterize(&self.fonts, font, glyph, size_px, subpixel_phase, format)
+    }
+
+    #[cfg(not(windows))]
+    fn rasterize_platform(
+        &mut self,
+        _font: FontId,
+        _glyph: GlyphId,
+        _size_px: f32,
+        _format: GlyphFormat,
+        _subpixel_phase: u8,
+    ) -> Option<GlyphImage> {
+        None
+    }
+
+    /// Rasterises a glyph with the portable outline rasteriser.
+    fn rasterize_outline(
+        &mut self,
+        font: FontId,
+        glyph: GlyphId,
+        size_px: f32,
+        subpixel: bool,
+        subpixel_phase: u8,
+    ) -> Option<GlyphImage> {
+        let zones = self.fonts.vertical_zones(font);
+        self.fonts
+            .with_outline_face(font, |face| {
+                if subpixel {
+                    rasterize_glyph_subpixel_with_zones(face, glyph, size_px, subpixel_phase, zones)
+                } else {
+                    rasterize_glyph_with_zones_at_phase(face, glyph, size_px, subpixel_phase, zones)
+                }
+            })?
+            .ok()
     }
 
     /// Rasterises and inserts a glyph, returning its placement.
@@ -229,42 +304,18 @@ impl TextSystem {
         key: GlyphKey,
         font: FontId,
         glyph: GlyphId,
-        strategy: RasterStrategy,
         size_px: f32,
         subpixel: bool,
         subpixel_phase: u8,
     ) -> Option<crate::types::AtlasPlacement> {
-        let raster = self.raster;
-        let image = match strategy {
-            RasterStrategy::Mtsdf => {
-                self.fonts.with_outline_face(font, |face| generate_mtsdf(face, glyph, &raster))?
-            }
-            RasterStrategy::Bitmap => {
-                let zones = self.fonts.vertical_zones(font);
-                if subpixel {
-                    self.fonts.with_outline_face(font, |face| {
-                        rasterize_glyph_subpixel_with_zones(
-                            face,
-                            glyph,
-                            size_px,
-                            subpixel_phase,
-                            zones,
-                        )
-                    })?
-                } else {
-                    self.fonts.with_outline_face(font, |face| {
-                        rasterize_glyph_with_zones_at_phase(
-                            face,
-                            glyph,
-                            size_px,
-                            subpixel_phase,
-                            zones,
-                        )
-                    })?
+        let format = if subpixel { GlyphFormat::Subpixel } else { GlyphFormat::Grayscale };
+        let (image, platform) =
+            match self.rasterize_platform(font, glyph, size_px, format, subpixel_phase) {
+                Some(image) => (image, true),
+                None => {
+                    (self.rasterize_outline(font, glyph, size_px, subpixel, subpixel_phase)?, false)
                 }
-            }
-        }
-        .ok()?;
+            };
 
         // A glyph with no ink — a space, a control character — is a normal
         // result, not a failure. It occupies no atlas area and is reported as a
@@ -280,7 +331,6 @@ impl TextSystem {
                     size: spherekit_core::Size { width: 0, height: 0 },
                 },
                 bounds_em: image.bounds_em,
-                range_em: image.range_em,
                 format: image.format,
             });
         }
@@ -288,14 +338,12 @@ impl TextSystem {
         match self.atlas.insert(key, &image) {
             Ok(p) => {
                 self.stats.glyph_misses += 1;
-                match strategy {
-                    RasterStrategy::Mtsdf => self.stats.mtsdf_glyphs += 1,
-                    RasterStrategy::Bitmap => {
-                        self.stats.bitmap_glyphs += 1;
-                        if subpixel {
-                            self.stats.subpixel_glyphs += 1;
-                        }
-                    }
+                self.stats.bitmap_glyphs += 1;
+                if subpixel {
+                    self.stats.subpixel_glyphs += 1;
+                }
+                if platform {
+                    self.stats.platform_glyphs += 1;
                 }
                 Some(p)
             }
@@ -314,34 +362,12 @@ impl TextSystem {
 impl GlyphProvider for TextSystem {
     fn place_glyph(&mut self, request: GlyphRequest) -> Option<GlyphPlacement> {
         let scale = ScaleFactor::new(request.device_scale);
-        let strategy = self.strategy(request.mode, request.font_size, scale);
         let subpixel_phase = request.subpixel_phase.min(3);
-
-        let key = match strategy {
-            // One distance field serves every size, which is the entire point
-            // of MTSDF; keying it by size would defeat the cache and multiply
-            // the atlas footprint by the number of sizes in the interface.
-            RasterStrategy::Mtsdf => GlyphKey::mtsdf(request.font, request.glyph, 0),
-            RasterStrategy::Bitmap => {
-                let size_px = bitmap_size_px(request.font_size, scale);
-                if request.subpixel {
-                    GlyphKey::subpixel_bitmap(
-                        request.font,
-                        request.glyph,
-                        0,
-                        size_px,
-                        subpixel_phase,
-                    )
-                } else {
-                    GlyphKey::bitmap_with_phase(
-                        request.font,
-                        request.glyph,
-                        0,
-                        size_px,
-                        subpixel_phase,
-                    )
-                }
-            }
+        let size_key = bitmap_size_px(request.font_size, scale);
+        let key = if request.subpixel {
+            GlyphKey::subpixel_bitmap(request.font, request.glyph, 0, size_key, subpixel_phase)
+        } else {
+            GlyphKey::bitmap_with_phase(request.font, request.glyph, 0, size_key, subpixel_phase)
         };
 
         let placement = if let Some(p) = self.atlas.touch(&key) {
@@ -353,7 +379,6 @@ impl GlyphProvider for TextSystem {
                 key,
                 request.font,
                 request.glyph,
-                strategy,
                 size_px,
                 request.subpixel,
                 subpixel_phase,
@@ -365,8 +390,6 @@ impl GlyphProvider for TextSystem {
             page: placement.page,
             uv: placement.uv,
             bounds_em: [b.min_x(), b.min_y(), b.width(), b.height()],
-            range_em: placement.range_em,
-            is_bitmap: matches!(placement.format, GlyphFormat::Grayscale | GlyphFormat::Subpixel),
             is_subpixel: placement.format == GlyphFormat::Subpixel,
             texel_size: [placement.texels.size.width, placement.texels.size.height],
         })
@@ -394,7 +417,6 @@ mod tests {
             glyph,
             font_size: px(size),
             device_scale: scale,
-            mode: TextRasterMode::Auto,
             subpixel: false,
             subpixel_phase: 0,
         }
@@ -436,7 +458,7 @@ mod tests {
             return;
         };
         let Some(glyph) = system.fonts().glyph_index(font, 'A') else { return };
-        let base = GlyphRequest { mode: TextRasterMode::Bitmap, ..request(font, glyph, 16.0, 1.0) };
+        let base = request(font, glyph, 16.0, 1.0);
 
         let gray0 = system.place_glyph(base).expect("gray phase zero");
         let gray1 =
@@ -450,8 +472,8 @@ mod tests {
 
         assert_ne!(gray0.uv, gray1.uv, "phases aliased in the atlas");
         assert_eq!(gray1, gray1_again);
-        assert!(gray1.is_bitmap && !gray1.is_subpixel);
-        assert!(rgb1.is_bitmap && rgb1.is_subpixel);
+        assert!(!gray1.is_subpixel);
+        assert!(rgb1.is_subpixel);
         assert_ne!(gray1.page, rgb1.page, "R8 and RGB8 coverage shared a page");
         assert_eq!(system.stats().glyph_misses, 3);
         assert_eq!(system.stats().glyph_hits, 1);
@@ -459,56 +481,48 @@ mod tests {
     }
 
     #[test]
-    fn one_distance_field_serves_every_size() {
-        // The headline property of MTSDF. If this ever fails, the atlas is
-        // being keyed by size and its footprint scales with the type scale.
+    fn each_device_size_gets_its_own_bitmap_at_exactly_that_size() {
         let Some((mut system, font)) = with_font() else {
             eprintln!("no system font; skipping");
             return;
         };
         let Some(glyph) = system.fonts().glyph_index(font, 'M') else { return };
 
-        let big = GlyphRequest { mode: TextRasterMode::Mtsdf, ..request(font, glyph, 48.0, 1.0) };
-        let bigger = GlyphRequest {
-            mode: TextRasterMode::Mtsdf,
-            subpixel: true,
-            subpixel_phase: 3,
-            ..request(font, glyph, 96.0, 1.0)
-        };
-        let a = system.place_glyph(big).expect("48 px");
-        let b = system.place_glyph(bigger).expect("96 px");
-        assert_eq!(a.uv, b.uv, "two sizes rasterised two separate fields");
-        assert!(!b.is_subpixel, "a distance field must ignore bitmap-only subpixel options");
-        assert_eq!(system.stats().mtsdf_glyphs, 1);
+        let small = system.place_glyph(request(font, glyph, 12.0, 1.0)).expect("12 px");
+        let large = system.place_glyph(request(font, glyph, 48.0, 1.0)).expect("48 px");
+        assert_ne!(small.uv, large.uv, "two sizes aliased in the atlas");
+        // A capital M is roughly 0.7 em tall, so the bitmaps scale with the size.
+        assert!(large.texel_size[1] > small.texel_size[1] * 3, "{small:?} vs {large:?}");
+        // And 13 logical px at 2x is the same device size as 26 at 1x.
+        let hidpi = system.place_glyph(request(font, glyph, 13.0, 2.0)).expect("13 px @2x");
+        let lodpi = system.place_glyph(request(font, glyph, 26.0, 1.0)).expect("26 px @1x");
+        assert_eq!(hidpi, lodpi, "the cache must key on device pixels");
+        assert_eq!(system.stats().bitmap_glyphs, 3);
     }
 
+    #[cfg(windows)]
     #[test]
-    fn small_text_takes_the_bitmap_path_and_large_text_does_not() {
+    fn windows_rasterises_through_directwrite_by_default() {
         let Some((mut system, font)) = with_font() else {
             eprintln!("no system font; skipping");
             return;
         };
-        let Some(glyph) = system.fonts().glyph_index(font, 'x') else { return };
-
-        let small = system.place_glyph(request(font, glyph, 9.0, 1.0)).expect("9 px");
-        let large = system.place_glyph(request(font, glyph, 32.0, 1.0)).expect("32 px");
-        assert!(small.is_bitmap, "9 logical px should fall back to a bitmap");
-        assert!(!large.is_bitmap, "32 logical px should use a distance field");
-        assert!(large.range_em > 0.0, "a distance field must report its range");
+        let Some(glyph) = system.fonts().glyph_index(font, 'g') else { return };
+        system.place_glyph(request(font, glyph, 14.0, 1.0)).expect("g");
+        assert_eq!(system.stats().platform_glyphs, 1, "{:?}", system.stats());
     }
 
     #[test]
-    fn a_high_dpi_display_keeps_small_logical_text_on_the_field_path() {
-        // 13 logical px at 2x is 26 device px, where the field is minified only
-        // 1.9x and reconstructs correctly. Choosing on the logical size alone
-        // would wrongly send crisp HiDPI text down the bitmap path.
+    fn the_outline_rasteriser_can_be_forced() {
         let Some((mut system, font)) = with_font() else {
             eprintln!("no system font; skipping");
             return;
         };
-        let Some(glyph) = system.fonts().glyph_index(font, 'o') else { return };
-        let p = system.place_glyph(request(font, glyph, 13.0, 2.0)).expect("13 px at 2x");
-        assert!(!p.is_bitmap, "HiDPI small text was sent to the bitmap fallback");
+        system.set_rasterizer(GlyphRasterizer::Outline);
+        let Some(glyph) = system.fonts().glyph_index(font, 'g') else { return };
+        let p = system.place_glyph(request(font, glyph, 14.0, 1.0)).expect("g");
+        assert!(p.texel_size[0] > 0 && p.texel_size[1] > 0);
+        assert_eq!(system.stats().platform_glyphs, 0);
     }
 
     #[test]
@@ -551,36 +565,20 @@ mod tests {
     }
 
     #[test]
-    fn changing_the_raster_config_invalidates_resident_fields() {
-        // Two fields generated at different ranges cannot share a page; keeping
-        // the old ones would render them with the wrong smoothing.
-        let Some((mut system, font)) = with_font() else {
-            eprintln!("no system font; skipping");
-            return;
-        };
-        let Some(glyph) = system.fonts().glyph_index(font, 'A') else { return };
-        system.place_glyph(GlyphRequest {
-            mode: TextRasterMode::Mtsdf,
-            ..request(font, glyph, 24.0, 1.0)
-        });
-        assert!(!system.atlas().is_empty());
-
-        system.set_raster_config(GlyphRasterConfig::new(64.0, 6.0));
-        assert!(system.atlas().is_empty(), "stale fields survived a config change");
-    }
-
-    #[test]
-    fn setting_the_same_raster_config_twice_does_not_clear_the_atlas() {
+    fn changing_the_rasteriser_invalidates_resident_glyphs() {
+        // Two rasterisers hint and filter differently; keeping the old glyphs
+        // would put two renditions of the same letter side by side.
         let Some((mut system, font)) = with_font() else {
             eprintln!("no system font; skipping");
             return;
         };
         let Some(glyph) = system.fonts().glyph_index(font, 'A') else { return };
         system.place_glyph(request(font, glyph, 24.0, 1.0));
-        let before = system.atlas().len();
-        let config = GlyphRasterConfig::default();
-        system.set_raster_config(config);
-        system.set_raster_config(config);
-        assert_eq!(system.atlas().len(), before, "an idempotent set threw the atlas away");
+        assert!(!system.atlas().is_empty());
+
+        system.set_rasterizer(GlyphRasterizer::Platform);
+        assert!(!system.atlas().is_empty(), "an idempotent set threw the atlas away");
+        system.set_rasterizer(GlyphRasterizer::Outline);
+        assert!(system.atlas().is_empty(), "stale glyphs survived a rasteriser change");
     }
 }

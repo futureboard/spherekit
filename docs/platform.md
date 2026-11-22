@@ -82,17 +82,20 @@ adapter, creating a device, configuring a swapchain, scanning the system fonts, 
 element tree — happens with an empty rectangle already on screen, and the user sees a white flash
 for the whole of it.
 
-Measured on one machine, an NVIDIA GTX 1060 on Windows 11:
+Measured on one machine, an NVIDIA GTX 1060 on Windows 11, under the wgpu backend this engine used
+before Direct3D 11:
 
 ```text
 init: gpu 706 ms, fonts 22 ms
 first frame: 46 ms
 ```
 
-Three quarters of a second of blank window, and **the GPU is the cost, not the fonts** — which is
-the opposite of what the `load_system_fonts` doc comment would lead you to guess. Restricting
-`WGPU_BACKEND` to a single backend saves only 50-70 ms of it; the rest is the driver creating a
-device and is not something this engine can shorten.
+Three quarters of a second of blank window, and **the GPU was the cost, not the fonts** — which is
+the opposite of what the `load_system_fonts` doc comment would lead you to guess. Most of it was the
+driver creating a device, which is not something this engine can shorten. The Direct3D 11 backend
+removed one avoidable part — compiling HLSL at runtime cost about 180 ms and is now done at build
+time — but the figures above have not been re-measured since, and `InitTiming` still reports the
+split (`gpu` is renderer creation, whichever backend that is).
 
 So the fix is not to make start-up fast. It is to not show anything until there is something to
 show:
@@ -202,12 +205,18 @@ translucent so the material remains visible. `WindowBackdrop::None` removes the 
 returns `Unsupported` on platforms without a system compositor API, where renderer-side
 `Styled::backdrop_blur` remains the portable fallback.
 
-On Windows, transparent surfaces default to wgpu's DX12/DXGI DirectComposition-visual path because
-Vulkan WSI transparency is driver-dependent, especially on discrete NVIDIA adapters. The plain
-DX12 `DxgiFromHwnd` presentation path does not support transparency, so it is not used for this
-case. Set `WGPU_BACKEND=vulkan` only when that backend is required for a particular deployment; the
-renderer logs the selected alpha mode and surface usages so a driver that exposes only opaque
-composition is immediately visible in diagnostics.
+On Windows, the Direct3D 11 renderer presents *every* window — transparent or not — through a
+flip-model swap chain created for composition and bound to the HWND with DirectComposition
+(`CreateTargetForHwnd`, a visual, `SetContent`). A swap chain created directly for an HWND composites
+opaquely; a composition swap chain is the only way DXGI offers per-pixel alpha, and using that path
+for every window means a transparent window is not a special case with its own bugs. A transparent
+surface's swap chain uses premultiplied alpha. The window must be created without a redirection
+bitmap (`WS_EX_NOREDIRECTIONBITMAP`), or GDI's opaque redirection surface stays underneath the visual;
+`spherekit-platform` sets it for transparent windows.
+
+The Skia backend presents through `softbuffer`, which blits opaque pixels only, so a transparent
+window rendered by Skia comes out opaque. That matters on Windows only when Direct3D 11 was
+unavailable or Skia was forced.
 On Windows 11 24H2 and later, the platform also enables premultiplied redirection alpha and
 extends the DWM frame through the custom client area; older Windows builds keep the blur-behind
 compatibility path.
@@ -256,6 +265,33 @@ If it is built, the shape is known: `ControlFlow` becomes a wait strategy — `W
 remainder **rounded up**, because truncating a sub-millisecond wait to zero silently converts
 `WaitUntil` into `Poll` and burns a core.
 
+## Choosing a renderer
+
+`SphereKitSurface` picks a renderer per window from `SurfaceOptions::backend`:
+
+| `Backend` | Windows | Linux, macOS |
+|---|---|---|
+| `Auto` (default) | Direct3D 11 on a hardware device; Skia if none can be created, with a logged warning | Skia |
+| `D3D11` | Direct3D 11, or an error if there is no hardware device | Error |
+| `Skia` | Skia | Skia |
+
+`SPHEREKIT_BACKEND=d3d11|skia|auto` overrides the application's choice, so a diagnostic run never
+needs a rebuild. `SphereKitSurface::backend()` reports what was actually resolved, after `Auto`, any
+fallback and the environment variable.
+
+A window never gets WARP, Direct3D's software rasteriser: the Skia backend is the better software
+path for a window. `SphereKitSurface::new_offscreen` does allow WARP under `Auto`, so screenshots and
+pixel tests run on any Windows machine, GPU or not.
+
+| | Direct3D 11 | Skia |
+|---|---|---|
+| Presents through | DXGI flip model + DirectComposition | `softbuffer`: GDI, X11, Wayland, CoreGraphics |
+| Transparent windows | Yes | No, rendered opaque |
+| Vsync, `PresentPreference` | Sync interval; frame-latency waitable object | Ignored |
+| Needs | Feature level 11_0 | Nothing beyond the window system |
+
+`docs/rendering.md` covers what each backend draws differently.
+
 ## Plug-in embedding
 
 The engine must tolerate not owning the process. A VST3 or CLAP editor owns neither the main thread
@@ -270,8 +306,12 @@ pub enum WindowTarget {
 }
 ```
 
-Both implement `HasWindowHandle` and `HasDisplayHandle`, so `WgpuRenderer::new` and
-`SphereKitSurface::new` accept either. `WindowAttributes::with_parent` covers the case where the
+Both implement `HasWindowHandle` and `HasDisplayHandle`, so `SphereKitSurface::new` accepts either.
+`D3D11Renderer::new` takes any Win32 handle; `SkiaRenderer::new` additionally needs the window shared
+as an `Arc`, because `softbuffer` keeps it for the surface's lifetime.
+
+A plug-in whose host owns the GPU — a DAW with its own renderer, say — can set
+`SurfaceOptions::backend = Backend::Skia` and stay off the device entirely. `WindowAttributes::with_parent` covers the case where the
 engine creates a child window inside a host-supplied parent.
 
 `App::run` is documented as main-thread-only and **not for plug-ins** — a plug-in must not call it

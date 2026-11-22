@@ -56,8 +56,8 @@ pub struct Palette {
 pub struct Typography {
     /// Smallest readable size: units, tick labels.
     ///
-    /// Ten pixels is where the MTSDF path hands off to the bitmap fallback on a
-    /// 1x display, which is exactly why this token exists rather than being
+    /// Ten pixels is about where hinting starts to decide legibility on a 1x
+    /// display, which is exactly why this token exists rather than being
     /// spelled inline.
     pub xs: Px,
     /// Dense UI labels, the workhorse size in a mixer.

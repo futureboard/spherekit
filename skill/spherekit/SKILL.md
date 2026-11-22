@@ -5,9 +5,11 @@ description: Work on SphereKit, the GPU-first Rust graphics and UI engine in thi
 
 # SphereKit
 
-A GPU-first graphics and UI engine in pure Rust for realtime creative
+A GPU-first graphics and UI engine in Rust for realtime creative
 applications: digital audio workstations, audio plug-ins, creative tools and
-visualisation. Sixteen crates plus an npm package, all at `2026.8.0`.
+visualisation. It renders through Direct3D 11 on Windows and through Skia
+(prebuilt, on the CPU) as the fallback and on Linux/macOS. The workspace
+crates plus an npm package, all at `2026.8.0`.
 
 ## Read this first
 
@@ -28,14 +30,19 @@ problem.
 - **An unchanged tree is free.** `UiTree::build` reconciles by identity; an
   unchanged frame creates no nodes and lays out nothing. Styling now matches
   this via a resolved-style cache.
-- **Text is a distance field.** Glyphs are rasterised once and sampled at any
-  size, so zooming re-rasterises nothing.
+- **Text is a coverage bitmap at the exact device size.** Every glyph is
+  rasterised for its device pixel size and a quarter-pixel phase (DirectWrite
+  on Windows, a pure-Rust outline rasteriser elsewhere) and cached in the
+  atlas; the renderer only tints bitmaps. Shaping and layout never depend on
+  the rasteriser.
 - **Realtime audio never renders from the audio thread.** The boundary is a
   lock-free ring or snapshot, and the ring is allowed to drop rather than block.
 - **Colour is linear.** Blending and gradient interpolation happen in linear
   light.
-- **The backend is a seam.** No `wgpu` type appears in any public API outside
-  `spherekit-wgpu`; no `taffy` type appears outside `spherekit-layout`.
+- **The backend is a seam.** Two renderers implement `RendererBackend`:
+  `spherekit-d3d11` (Windows GPU) and `spherekit-skia` (CPU fallback, and the
+  only backend on Linux/macOS). No Direct3D or Skia type appears outside its
+  crate; no `taffy` type appears outside `spherekit-layout`.
 - **Unsupported input is ignored, never reinterpreted.** The CSS engine drops
   `width: 12` rather than guessing `12px`; the SVG loader refuses a document it
   cannot render rather than returning a silently empty icon.
@@ -47,7 +54,7 @@ Load the reference file for the area you are working in. They live in
 
 | File | Covers |
 |---|---|
-| `skill-data/crates.md` | The sixteen crates, what is in each, the layering, feature flags, the three example applications |
+| `skill-data/crates.md` | The crates, what is in each, the two renderers and how one is chosen, the layering, feature flags, the three example applications |
 | `skill-data/ui.md` | Elements, `Styled`/`Interactive`/`ParentElement`, the invalidation split, the frame loop, widgets, theming |
 | `skill-data/css.md` | `Stylesheet`, resolving, what is supported and what is deliberately absent, and why the cascade is shaped for speed |
 | `skill-data/react-v8.md` | The React host, the API bridge protocol, custom host types, the V8 embedding, the prelude, bundling, the two non-optional performance rules |

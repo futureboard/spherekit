@@ -166,7 +166,7 @@ impl LinearColor {
     /// Fully transparent.
     pub const TRANSPARENT: Self = Self { r: 0.0, g: 0.0, b: 0.0, a: 0.0 };
 
-    /// The four channels as an array, the layout a WGSL `vec4<f32>` expects.
+    /// The four channels as an array, the layout a shader `float4` expects.
     #[inline]
     pub const fn to_array(self) -> [f32; 4] {
         [self.r, self.g, self.b, self.a]

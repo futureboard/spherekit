@@ -18,7 +18,7 @@
                                        |         spherekit-ui elements
                                        |              |
                                        |              v
-                                       |         layout -> paint -> wgpu
+                                       |         layout -> paint -> render
                                        |
   __spherekitReceive(frame)  <---------+  native events, by node id
 ```

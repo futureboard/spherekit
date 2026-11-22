@@ -34,19 +34,18 @@ pub mod quad_flags {
 }
 
 /// Flag bits carried in [`GlyphInstance::flags`].
+///
+/// Every glyph is a coverage bitmap rasterised at its exact device size, so
+/// there is no per-glyph choice of representation left to flag.
 pub mod glyph_flags {
-    /// The glyph samples a grayscale bitmap rather than a distance field.
-    pub const BITMAP: u32 = 1 << 0;
-    /// The glyph has a synthetic outline.
-    pub const OUTLINE: u32 = 1 << 1;
     /// The active clip is a rounded rectangle.
-    pub const CLIP_ROUNDED: u32 = 1 << 2;
+    pub const CLIP_ROUNDED: u32 = 1 << 0;
     /// The glyph carries independent red, green and blue LCD coverage.
     ///
     /// Such an instance must run through the dual-source text pipeline; the
     /// ordinary premultiplied-alpha pipeline cannot preserve three independent
     /// destination blend factors.
-    pub const SUBPIXEL: u32 = 1 << 3;
+    pub const SUBPIXEL: u32 = 1 << 1;
 }
 
 /// One instanced rectangle-family primitive.
@@ -124,6 +123,11 @@ impl QuadInstance {
 }
 
 /// One instanced glyph quad.
+///
+/// The quad covers the glyph's coverage bitmap exactly; the backend samples the
+/// atlas, applies [`GlyphInstance::coverage_contrast`] if it blends in linear
+/// light (Direct3D 11 does; Skia blends in sRGB space, where the correction is
+/// already inherent, and skips it), and multiplies by the colour. Sixty-four bytes: three `vec4`s, one float and three indices.
 #[derive(Copy, Clone, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 pub struct GlyphInstance {
@@ -133,47 +137,27 @@ pub struct GlyphInstance {
     pub uv: [f32; 4],
     /// Linear premultiplied fill color.
     pub color: [f32; 4],
-    /// Linear premultiplied outline color.
-    pub outline_color: [f32; 4],
-    /// The distance field's range, expressed in destination pixels.
-    ///
-    /// The shader needs this to convert a sampled distance into a screen-space
-    /// coverage value. Passing it per instance rather than per pipeline is what
-    /// lets one batch mix font sizes and still antialias every glyph correctly.
-    pub px_range: f32,
-    /// Outline half-width in distance-field units.
-    pub outline_width: f32,
     /// Exponent applied to coverage; see [`crate::GlyphRun::coverage_contrast`].
     pub coverage_contrast: f32,
-    /// The glyph's em size in destination pixels, before the transform.
-    ///
-    /// The vertex stage folds the transform's scale in and hands the result to
-    /// [`crate::mtsdf_edge_ramp`], which is why the *size* travels rather than
-    /// the compensation it implies: a panel zoomed to half puts 26 device-pixel
-    /// text on screen at 13, and only the vertex stage knows that.
-    ///
-    /// It occupies what used to be padding. The vertex layout reads the floats
-    /// as one `vec4` and the indices as one `vec4<u32>`; interleaving them would
-    /// mean a `u32` arriving in the shader reinterpreted as a float, so this
-    /// slot has to stay a float whether or not it carries anything.
-    pub em_px: f32,
     /// Bit set from [`glyph_flags`].
     pub flags: u32,
-    /// Which atlas page to sample.
-    pub atlas_page: u32,
     /// Index into the frame's transform table.
     pub transform_index: u32,
     /// Index into the frame's clip table.
     pub clip_index: u32,
 }
 
-const _: () = assert!(core::mem::size_of::<GlyphInstance>() == 96);
+const _: () = assert!(core::mem::size_of::<GlyphInstance>() == 64);
 
 /// A clip region as the GPU sees it.
 #[derive(Copy, Clone, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 pub struct GpuClip {
-    /// `[min_x, min_y, max_x, max_y]` in device pixels.
+    /// `[min_x, min_y, max_x, max_y]` in scene-absolute *logical* pixels.
+    ///
+    /// Not device pixels and not the primitive's local space: a backend tests
+    /// the fragment's position after the transform and before the scale
+    /// factor, i.e. `matrix · local + translation / scale_factor`.
     pub bounds: [f32; 4],
     /// Corner radii `[tl, tr, br, bl]`, zero for a plain rectangle.
     pub radii: [f32; 4],

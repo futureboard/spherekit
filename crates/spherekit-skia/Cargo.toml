@@ -1,0 +1,21 @@
+[package]
+name = "spherekit-skia"
+description = "Skia CPU rendering backend for SphereKit: the software fallback."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords = ["graphics", "rendering", "skia", "software", "2d"]
+categories = ["graphics", "rendering"]
+
+[dependencies]
+spherekit-core.workspace = true
+spherekit-render.workspace = true
+skia-safe.workspace = true
+softbuffer.workspace = true
+raw-window-handle.workspace = true
+bytemuck.workspace = true
+rustc-hash.workspace = true
+tracing.workspace = true

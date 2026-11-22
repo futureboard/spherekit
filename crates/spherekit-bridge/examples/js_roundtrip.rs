@@ -11,7 +11,7 @@
 //! without a build step is the point — when the React demo misbehaves, this is
 //! the example that says whether the fault is in the bridge or in the bundle.
 
-#[cfg(all(feature = "v8", windows))]
+#[cfg(feature = "v8")]
 fn main() {
     use spherekit_bridge::JsBridge;
 
@@ -109,12 +109,12 @@ console.log("getTree answered revision " + tree.result.revision);
     println!("v8: {}", spherekit_bridge::v8_version());
 }
 
-#[cfg(not(all(feature = "v8", windows)))]
+#[cfg(not(feature = "v8"))]
 fn main() {
-    // Not a failure: the example is a demonstration, and a workspace build on a
-    // machine without the V8 prebuilt should still compile every target in it.
+    // Not a failure: a workspace build without the `v8` feature should still
+    // compile every target in it.
     println!(
-        "js_roundtrip needs the `v8` feature on Windows x86_64.\n\
+        "js_roundtrip needs the `v8` feature.\n\
          Run: cargo run -p spherekit-bridge --features v8 --example js_roundtrip"
     );
 }

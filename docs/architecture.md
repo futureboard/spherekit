@@ -12,11 +12,14 @@ spherekit-ui              element tree, event dispatch, focus, widgets
 spherekit-layout          retained nodes, style, dirty flags, hit testing
     ↓
 spherekit-render          canvas → scene → cull → batch → CompiledFrame
-    ↓
-spherekit-wgpu            the only crate that knows wgpu exists
-    ↓
-D3D12 / Vulkan / Metal / WebGPU
+    ↓                                  ↓
+spherekit-d3d11                     spherekit-skia
+Direct3D 11 + DirectComposition     Skia raster + softbuffer
+(Windows GPU)                       (CPU fallback; Linux, macOS)
 ```
+
+`spherekit` picks one per window (`Backend::Auto`: Direct3D 11 on Windows when a hardware device
+exists, Skia otherwise). Each backend is the only crate that knows its graphics API exists.
 
 Dependencies point downward and never upward. `spherekit-render` does not know what a node is.
 `spherekit-core` does not know what a GPU is.
@@ -66,19 +69,20 @@ this property is *measured* rather than asserted, and there is a test that marks
 
 ### 3. Backend details must not leak
 
-Three types are load-bearing here and none of them appear in a public signature outside their own
+Four families of types are load-bearing here and none of them appear in a public signature outside their own
 crate:
 
 | Type | Hidden behind |
 |---|---|
-| `wgpu::*` | `RendererBackend`, `CompiledFrame` |
+| `windows::Win32::Graphics::Direct3D11::*`, `skia_safe::*` | `RendererBackend`, `CompiledFrame` |
 | `taffy::*` | `LayoutEngine`, SphereKit's own `Style` |
 | `winit::*` | SphereKit's own `Window`, `WindowEvent`, `Key` |
 | `lyon::*` | `Tessellator`, `Mesh` |
 
 The point is not purity. It is that `CompiledFrame` is pure data, so the batch compiler is testable
-without a device; and that a native D3D12 or software backend can be added later without
-redesigning anything above it.
+without a device; and that a backend can be replaced without redesigning anything above it. That
+was tested for real: the original wgpu backend was replaced by Direct3D 11 and Skia without a change
+to any crate above `spherekit-render`'s trait, which gained only `set_atlas_page` and `read_pixels`.
 
 ## Crates
 
@@ -86,8 +90,9 @@ redesigning anything above it.
 |---|---|---|
 | `spherekit-core` | Units, geometry, transforms, colour, paths, paint, ids, errors | — |
 | `spherekit-render` | Canvas, scene, culling, batching, tessellation, backend trait | core |
-| `spherekit-wgpu` | wgpu backend, WGSL, pipelines, GPU buffers, textures | core, render |
-| `spherekit-text` | Font db, shaping, line layout, MTSDF, atlas, caches | core |
+| `spherekit-d3d11` | Direct3D 11 backend, HLSL (precompiled), DirectComposition presentation | core, render |
+| `spherekit-skia` | Skia CPU backend, `softbuffer` presentation | core, render |
+| `spherekit-text` | Font db, shaping, line layout, coverage rasterisation (DirectWrite, outline), atlas, caches | core, render |
 | `spherekit-layout` | Retained tree, style, dirty flags, hit testing, scrolling | core |
 | `spherekit-image` | Decoding, texture cache, fit resolution | core |
 | `spherekit-svg` | SVG parsing, cached tessellation | core, render |
@@ -121,7 +126,7 @@ paint                 elements record into a Scene via Canvas
       ↓
 scene compilation     cull, batch, tessellate → CompiledFrame
       ↓
-GPU render            RendererBackend
+render                RendererBackend: Direct3D 11 or Skia
 ```
 
 Stages are skippable. An idle window with nothing dirty runs none of them. A paint-only frame runs
@@ -164,9 +169,8 @@ one thread; expensive asset work moves off it:
 
 | Thread | Work |
 |---|---|
-| UI / render | Build, layout, paint, compile, submit |
+| UI / render | Build, layout, paint, compile (including glyph rasterisation on an atlas miss), submit |
 | Asset worker | Image decoding, SVG parsing |
-| Glyph worker | MTSDF generation |
 | Audio (external) | DSP. Never touches the engine. |
 
 The audio boundary is the one that is not negotiable, and it has its own document:
@@ -198,7 +202,7 @@ hours inside someone else's process is not a performance problem, it is a crash.
 Per-frame allocation is designed out rather than optimised later:
 
 - `Scene::reset` keeps every allocation.
-- `GrowableBuffer` grows geometrically and never shrinks in normal operation.
+- GPU buffers grow geometrically and never shrink in normal operation.
 - `Tessellator` holds its scratch buffers across frames.
 - Offscreen layer targets come from a pool.
 - `SmallVec` inline capacity covers the common case for glyph runs, gradient stops and the canvas
@@ -210,6 +214,8 @@ Roughly two thirds of the test suite runs with no GPU, because roughly two third
 no business needing one. Geometry, colour, paths, scenes, culling, batching, layout and dirty
 propagation are all pure functions of their input.
 
-What does need a device is isolated into `crates/spherekit-wgpu/tests/pipelines.rs`, which creates a
-headless adapter, validates every WGSL module through naga, and builds every pipeline for both the
-swapchain and the layer format. On a machine with no adapter it skips rather than fails.
+What does need a renderer is isolated into the backends' own suites,
+`crates/spherekit-d3d11/tests/` and `crates/spherekit-skia/tests/`. Each renders scenes offscreen
+through the real batch compiler and asserts on the pixels it reads back. Skia needs nothing but a
+CPU; Direct3D 11 offscreen uses WARP when there is no GPU, so the suite runs on any Windows machine,
+and elsewhere it reports why and passes.

@@ -17,7 +17,7 @@ use crate::style::PaintStyle;
 use smallvec::SmallVec;
 use spherekit_core::{Brush, Color, ElementId, Px, Size};
 use spherekit_layout::{AvailableSpace, MeasureRequest, Style};
-use spherekit_render::{GlyphRun, PositionedGlyph, TextRasterMode};
+use spherekit_render::{GlyphRun, PositionedGlyph};
 use spherekit_text::{TextAlign, TextStyle, TextSystem, WrapMode};
 
 /// A run of text.
@@ -39,7 +39,6 @@ pub struct Label {
     scale: Option<crate::theme::TypeScale>,
     /// A colour named against the theme, resolved the same way.
     role: Option<crate::theme::TextRole>,
-    raster: TextRasterMode,
     /// Synthetic outline, for text over a busy backdrop such as a waveform.
     outline: Option<(Px, Color)>,
     /// Signed coverage exponent, or `None` to derive it from the contrast
@@ -63,7 +62,6 @@ pub fn label(text: impl Into<String>) -> Label {
         color: None,
         scale: None,
         role: None,
-        raster: TextRasterMode::Auto,
         outline: None,
         coverage_contrast: None,
     }
@@ -156,17 +154,14 @@ impl Label {
         self
     }
 
-    /// Forces a rasterisation strategy instead of choosing per glyph.
-    pub fn raster_mode(mut self, mode: TextRasterMode) -> Self {
-        self.raster = mode;
-        self
-    }
-
     /// Draws a synthetic outline behind the glyphs.
     ///
-    /// Uses the distance field's true-distance channel, so it costs no extra
-    /// rasterisation. Worth having for labels drawn over a waveform or a
-    /// spectrum, where no single colour reads against every backdrop.
+    /// Worth having for labels drawn over a waveform or a spectrum, where no
+    /// single colour reads against every backdrop. The outline is a halo: the
+    /// run is stamped [`OUTLINE_TAPS`] times around a circle of radius `width`
+    /// in the outline colour before the fill is drawn. That reuses the cached
+    /// glyph bitmaps, so it costs draw instances rather than rasterisation, and
+    /// it reads as a solid edge up to about two pixels wide.
     pub fn outline(mut self, width: Px, color: Color) -> Self {
         self.outline = Some((width, color));
         self
@@ -282,7 +277,6 @@ impl Element for Label {
             &layout,
             origin,
             color,
-            self.raster,
             (outline_width, outline_color),
             coverage_contrast,
         );
@@ -301,19 +295,50 @@ impl Element for Label {
     }
 }
 
+/// How many offset copies of a run make up a synthetic outline.
+///
+/// Eight directions close the gaps a four-tap cross leaves at the diagonals,
+/// which show as notches on round letters at one pixel and above.
+pub const OUTLINE_TAPS: usize = 8;
+
 /// Records a laid-out paragraph into a canvas at `origin`.
 ///
 /// Shared by [`Label`] and [`crate::widgets::TextField`] so that the two cannot
 /// disagree about where a glyph goes. A field draws a caret and a selection
 /// against the same layout it draws the text from, and a second copy of this
 /// loop would eventually drift from the first.
+///
+/// `outline` is `(width, colour)`; a zero width draws no outline. See
+/// [`Label::outline`].
 pub fn draw_layout(
     canvas: &mut spherekit_render::Canvas<'_>,
     layout: &spherekit_text::TextLayout,
     origin: spherekit_core::Point<Px>,
     color: Color,
-    raster: TextRasterMode,
     outline: (Px, Color),
+    coverage_contrast: f32,
+) {
+    let (outline_width, outline_color) = outline;
+    if outline_width > Px::ZERO && outline_color.a > 0.0 {
+        // Drawn first, so the fill lands on top of every halo tap.
+        let r = outline_width.get();
+        for i in 0..OUTLINE_TAPS {
+            let angle = i as f32 * core::f32::consts::TAU / OUTLINE_TAPS as f32;
+            let offset = spherekit_core::Point::new(
+                origin.x + Px(r * angle.cos()),
+                origin.y + Px(r * angle.sin()),
+            );
+            draw_runs(canvas, layout, offset, outline_color, coverage_contrast);
+        }
+    }
+    draw_runs(canvas, layout, origin, color, coverage_contrast);
+}
+
+fn draw_runs(
+    canvas: &mut spherekit_render::Canvas<'_>,
+    layout: &spherekit_text::TextLayout,
+    origin: spherekit_core::Point<Px>,
+    color: Color,
     coverage_contrast: f32,
 ) {
     for line in &layout.lines {
@@ -337,15 +362,7 @@ pub fn draw_layout(
                 .collect();
 
             canvas.draw_glyph_run(
-                GlyphRun {
-                    font: run.font,
-                    font_size: run.font_size,
-                    glyphs,
-                    raster,
-                    outline_width: outline.0,
-                    outline_color: outline.1,
-                    coverage_contrast,
-                },
+                GlyphRun { font: run.font, font_size: run.font_size, glyphs, coverage_contrast },
                 Brush::Solid(color),
             );
         }
@@ -578,7 +595,7 @@ mod tests {
     }
 
     #[test]
-    fn an_outline_is_carried_into_the_glyph_run() {
+    fn an_outline_draws_a_halo_of_runs_beneath_the_fill() {
         let Some(mut system) = text_system() else {
             eprintln!("no system font; skipping");
             return;
@@ -597,7 +614,11 @@ mod tests {
             let mut canvas = Canvas::new(&mut scene);
             tree.paint(&mut canvas, &mut system, viewport(), 0.0);
         }
-        assert!(scene.runs.iter().all(|r| r.outline_width == px(1.5)));
+        // One run for "Peak", stamped OUTLINE_TAPS times, then the fill.
+        assert_eq!(scene.runs.len(), OUTLINE_TAPS + 1);
+        let fill = scene.runs.last().unwrap().glyphs[0].position;
+        let tap = scene.runs[0].glyphs[0].position;
+        assert!(((tap.x - fill.x).get() - 1.5).abs() < 1e-4, "first tap sits `width` to the right");
     }
 
     #[test]

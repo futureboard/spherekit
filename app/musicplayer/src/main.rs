@@ -67,7 +67,7 @@ use spherekit::platform::{
 use spherekit::ui::{
     AnyElement, InputTranslator, IntoElement, ParentElement, Styled, Theme, div, label,
 };
-use spherekit::{Backend, SphereKitSurface, SurfaceOptions};
+use spherekit::{SphereKitSurface, SurfaceOptions};
 use spherekit_bridge::JsBridge;
 use spherekit_react::EventQueue;
 
@@ -457,7 +457,7 @@ impl MusicPlayer {
             .child(label("JavaScript runtime unavailable").text_size(px(20.0)))
             .child(label(reason).text_size(px(13.0)).text_color(Color::hex(0x8B93A5)))
             .child(
-                label("The V8 prebuilt is Windows x86_64 only; see docs/javascript.md.")
+                label("See docs/javascript.md for how V8 is fetched and linked.")
                     .text_size(px(12.0))
                     .text_color(Color::hex(0x5A6070)),
             )
@@ -515,14 +515,9 @@ impl AppHandler for MusicPlayer {
             window.physical_size(),
             window.scale_factor(),
             SurfaceOptions {
-                // D3D12 rather than whatever wgpu picks, which on a Windows
-                // machine with a discrete NVIDIA card is Vulkan. Nothing about
-                // this player needs Vulkan, and D3D12 is the path Windows
-                // capture and profiling tools actually understand.
-                //
-                // `WGPU_BACKEND` still wins, so comparing the two is a matter
-                // of setting a variable rather than editing this.
-                backend: Backend::Dx12,
+                // Left on `Auto`: Direct3D 11 where there is a GPU, Skia on
+                // the CPU where there is not. `SPHEREKIT_BACKEND=skia` forces
+                // the software path for comparison without a rebuild.
                 ..SurfaceOptions::default()
             },
         )) {

@@ -7,18 +7,22 @@
  * the window — which no React component knows about — is styled by resolving
  * the same rules against a native `spherekit-ui` element.
  *
- * That is the whole claim this demo exists to make. One cascade, no browser.
+ * One cascade, no browser.
  */
 
 :root {
-  --bg: #202124;
-  --surface: #2b2c2f;
-  --elevated: #333438;
-  --border: #414348;
+  --bg: #1b1c1f;
+  --sidebar: #16171a;
+  --surface: #25262a;
+  --elevated: #303136;
+  --border: #3b3d42;
   --text: #f0f0f1;
-  --muted: #acadb0;
+  --muted: #a3a5aa;
+  --faint: #6f7177;
   --accent: #78a8e8;
   --accent-pressed: #6394d4;
+  --good: #6cc38a;
+  --warn: #e6b45c;
   --danger: #d77880;
   --radius: 8px;
   --gutter: 12px;
@@ -28,13 +32,79 @@
 
 .root {
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
   width: 100%;
   height: 100%;
   background-color: var(--bg);
   color: var(--text);
   font-size: 14px;
-  padding: 16px;
+}
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  width: 168px;
+  padding: 16px 10px;
+  gap: 4px;
+  background-color: var(--sidebar);
+  border-right-width: 1px;
+  border-color: var(--border);
+}
+
+.brand {
+  display: flex;
+  flex-direction: column;
+  padding: 2px 8px 14px 8px;
+}
+
+.brand-title {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.brand-subtitle {
+  font-size: 12px;
+  color: var(--accent);
+  letter-spacing: 1.5px;
+}
+
+button.nav {
+  justify-content: flex-start;
+  background-color: var(--sidebar);
+  border-color: var(--sidebar);
+  padding: 8px 10px;
+}
+
+button.nav:hover {
+  background-color: var(--surface);
+}
+
+button.nav.selected {
+  background-color: var(--elevated);
+  border-color: var(--border);
+}
+
+.badge {
+  display: flex;
+  flex-direction: row;
+  justify-content: center;
+  padding: 4px 8px;
+  border-radius: 10px;
+  background-color: var(--elevated);
+}
+
+.badge-text {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--good);
+}
+
+.main {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  padding: 18px 20px;
   gap: var(--gutter);
 }
 
@@ -42,8 +112,13 @@
   display: flex;
   flex-direction: row;
   align-items: center;
-  justify-content: space-between;
-  padding-bottom: 4px;
+  gap: 14px;
+}
+
+.heading {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
 }
 
 .title {
@@ -55,6 +130,46 @@
 .subtitle {
   font-size: 12px;
   color: var(--muted);
+}
+
+.stat {
+  font-size: 11px;
+  color: var(--faint);
+  white-space: nowrap;
+}
+
+.page {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  gap: var(--gutter);
+}
+
+.section {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+  letter-spacing: 0.6px;
+}
+
+.caption {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.row {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
+}
+
+.row.tight {
+  gap: 4px;
+}
+
+.grow {
+  flex: 1;
 }
 
 /* ------------------------------------------------------------------ cards */
@@ -76,21 +191,205 @@
   letter-spacing: 0.4px;
 }
 
-.card > .value {
-  font-size: 18px;
+.value {
+  font-size: 13px;
   font-weight: 600;
   color: var(--text);
 }
 
-.row {
+/* The demonstration that combinators actually run: only a readout inside a
+   card marked `.telemetry` gets the accent treatment. */
+.telemetry .meter-readout > .value {
+  color: var(--accent);
+  font-size: 16px;
+  font-weight: 700;
+}
+
+/* ------------------------------------------------------------------ mixer */
+
+.mixer {
+  display: flex;
+  flex-direction: row;
+  gap: 10px;
+  flex: 1;
+}
+
+.strip {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  padding: 12px 8px;
+  background-color: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.strip.muted {
+  opacity: 0.55;
+}
+
+.strip-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.strip-body {
+  display: flex;
+  flex-direction: row;
+  justify-content: center;
+  gap: 8px;
+  flex: 1;
+  min-height: 120px;
+}
+
+.meter-track {
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  width: 8px;
+  background-color: #17181b;
+  border-radius: 3px;
+}
+
+.meter-fill {
+  width: 8px;
+  background-color: var(--good);
+  border-radius: 3px;
+}
+
+.meter-fill.warm {
+  background-color: var(--warn);
+}
+
+.meter-fill.hot {
+  background-color: var(--danger);
+}
+
+button.ms {
+  padding: 3px 9px;
+  font-size: 11px;
+}
+
+button.ms.mute-on {
+  background-color: var(--warn);
+  border-color: var(--warn);
+}
+
+button.ms.solo-on {
+  background-color: var(--accent);
+  border-color: var(--accent);
+}
+
+/* ------------------------------------------------------------ lists/forms */
+
+.segmented {
+  gap: 4px;
+}
+
+button.segment {
+  padding: 5px 12px;
+}
+
+button.segment.selected {
+  background-color: var(--accent);
+  border-color: var(--accent);
+}
+
+.list {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  gap: 2px;
+  padding: 4px;
+  background-color: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.list-row {
   display: flex;
   flex-direction: row;
   align-items: center;
   gap: 10px;
+  min-height: 40px;
+  padding: 4px 10px;
+  border-radius: 6px;
 }
 
-.grow {
+.list-row:nth-child(even) {
+  background-color: #2a2b30;
+}
+
+.list-row.done .task-title {
+  color: var(--faint);
+}
+
+.task-title {
+  font-size: 14px;
+  color: var(--text);
+}
+
+.empty {
+  font-size: 13px;
+  color: var(--faint);
+  padding: 16px;
+}
+
+.person {
+  display: flex;
+  flex-direction: column;
+}
+
+.person-name {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text);
+}
+
+.presence {
+  font-size: 11px;
+  color: var(--faint);
+}
+
+.presence.online {
+  color: var(--good);
+}
+
+.presence.away {
+  color: var(--warn);
+}
+
+.presence.busy {
+  color: var(--danger);
+}
+
+/* -------------------------------------------------------------- about */
+
+.kv-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.kv {
+  display: flex;
+  flex-direction: row;
+  gap: 12px;
+}
+
+.kv-name {
+  width: 150px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.kv-value {
   flex: 1;
+  font-size: 13px;
+  color: var(--text);
 }
 
 /* -------------------------------------------------------------- controls */
@@ -121,6 +420,16 @@ button.danger {
   border-color: var(--danger);
 }
 
+button.ghost {
+  background-color: var(--surface);
+  border-color: var(--surface);
+  padding: 4px 10px;
+}
+
+button.ghost:hover {
+  border-color: var(--border);
+}
+
 button:disabled {
   opacity: 0.45;
   cursor: not-allowed;
@@ -130,13 +439,6 @@ slider,
 knob,
 fader {
   cursor: pointer;
-}
-
-/* The demonstration that combinators actually run: only a meter inside a card
-   marked `.telemetry` gets the accent treatment. */
-.telemetry .meter > .value {
-  color: var(--accent);
-  font-weight: 700;
 }
 
 /* ------------------------------------------------------------- status bar */
@@ -150,10 +452,11 @@ fader {
   flex-direction: row;
   align-items: center;
   gap: 16px;
-  height: 26px;
+  height: 24px;
   padding: 0 12px;
-  background-color: var(--elevated);
-  border-radius: 6px;
+  background-color: var(--sidebar);
+  border-top-width: 1px;
+  border-color: var(--border);
 }
 
 .status-bar .status-item {

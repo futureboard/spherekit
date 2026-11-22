@@ -1,0 +1,36 @@
+[package]
+name = "spherekit-d3d11"
+description = "Direct3D 11 rendering backend for SphereKit, presented through DirectComposition."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords = ["graphics", "rendering", "d3d11", "directcomposition", "2d"]
+categories = ["graphics", "rendering"]
+
+[dependencies]
+spherekit-core.workspace = true
+spherekit-render.workspace = true
+raw-window-handle.workspace = true
+bytemuck.workspace = true
+rustc-hash.workspace = true
+tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_DirectComposition",
+    # WaitForSingleObjectEx, for the swap chain's frame-latency waitable.
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(windows)'.dev-dependencies]
+# The windowed smoke test creates a bare Win32 window to present into.
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }

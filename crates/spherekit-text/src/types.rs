@@ -128,11 +128,7 @@ pub struct GlyphKey {
     pub glyph: GlyphId,
     /// Hash of the active variation coordinates, or zero for a static instance.
     pub variation_hash: u64,
-    /// The rasterisation size in *device* pixels, rounded.
-    ///
-    /// Zero for distance-field glyphs, which are size-independent: that is the
-    /// whole point of MTSDF, and caching one field per size would defeat it.
-    /// Nonzero only for the small-size bitmap fallback.
+    /// The rasterisation size in *device* pixels, rounded. Never zero.
     pub bitmap_size: u16,
     /// Pixel format this key was rasterised into.
     ///
@@ -141,26 +137,12 @@ pub struct GlyphKey {
     pub format: GlyphFormat,
     /// Quarter-pixel horizontal phase, in `0..=3`.
     ///
-    /// Distance fields are position-independent and always use zero. Bitmap
-    /// rasterisation applies this offset before snapping the ink box, so each
+    /// Rasterisation applies this offset before snapping the ink box, so each
     /// nonzero phase names a distinct cached image.
     pub subpixel_phase: u8,
 }
 
 impl GlyphKey {
-    /// A key for a size-independent distance field.
-    #[inline]
-    pub fn mtsdf(font: FontId, glyph: GlyphId, variation_hash: u64) -> Self {
-        Self {
-            font,
-            glyph,
-            variation_hash,
-            bitmap_size: 0,
-            format: GlyphFormat::Mtsdf,
-            subpixel_phase: 0,
-        }
-    }
-
     /// A key for a size-specific grayscale bitmap.
     #[inline]
     pub fn bitmap(font: FontId, glyph: GlyphId, variation_hash: u64, size_px: u16) -> Self {
@@ -204,19 +186,11 @@ impl GlyphKey {
             subpixel_phase: subpixel_phase.min(3),
         }
     }
-
-    /// True when this key names a distance field rather than a bitmap.
-    #[inline]
-    pub fn is_mtsdf(self) -> bool {
-        self.format == GlyphFormat::Mtsdf
-    }
 }
 
 /// Pixel format of a rasterised glyph.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum GlyphFormat {
-    /// Four channels: RGB carry the multi-channel distance, A the true distance.
-    Mtsdf,
     /// One channel of coverage.
     Grayscale,
     /// Three channels of independently filtered RGB-stripe coverage.
@@ -230,7 +204,7 @@ impl GlyphFormat {
     #[inline]
     pub fn bytes_per_pixel(self) -> usize {
         match self {
-            GlyphFormat::Mtsdf | GlyphFormat::ColorBitmap => 4,
+            GlyphFormat::ColorBitmap => 4,
             GlyphFormat::Grayscale => 1,
             GlyphFormat::Subpixel => 3,
         }
@@ -251,20 +225,16 @@ pub struct GlyphImage {
     /// The glyph's bounding box in font-em units, relative to the pen position
     /// on the baseline, with y increasing downward.
     ///
-    /// Em units rather than pixels is what makes an MTSDF glyph reusable at
-    /// every size: the caller multiplies by the font size at draw time.
+    /// For a bitmap rasterised at `size_px` this is the texel box divided by
+    /// `size_px`, so the batch compiler can place it by multiplying by the font
+    /// size like any other em-space quantity.
     pub bounds_em: Rect<f32>,
-    /// How far the distance field extends beyond the outline, in em units.
-    ///
-    /// The shader converts this into a screen-space range to pick its smoothing
-    /// width, so it has to travel with the glyph rather than being a constant.
-    pub range_em: f32,
 }
 
 impl GlyphImage {
     /// An empty image, produced for glyphs with no outline such as a space.
     pub fn empty(format: GlyphFormat) -> Self {
-        Self { width: 0, height: 0, format, data: Vec::new(), bounds_em: Rect::ZERO, range_em: 0.0 }
+        Self { width: 0, height: 0, format, data: Vec::new(), bounds_em: Rect::ZERO }
     }
 
     /// True when the glyph has no visible coverage.
@@ -367,8 +337,6 @@ pub struct AtlasPlacement {
     pub texels: Rect<u32>,
     /// The glyph's bounds in em units, carried through from the raster step.
     pub bounds_em: Rect<f32>,
-    /// The distance-field range in em units, zero for bitmaps.
-    pub range_em: f32,
     /// Pixel format stored in this page.
     pub format: GlyphFormat,
 }
@@ -606,28 +574,22 @@ mod tests {
     }
 
     #[test]
-    fn mtsdf_keys_ignore_size_but_bitmap_keys_do_not() {
-        let a = GlyphKey::mtsdf(fid(0), GlyphId(5), 0);
-        let b = GlyphKey::mtsdf(fid(0), GlyphId(5), 0);
-        assert_eq!(a, b, "one distance field must serve every size");
-        assert!(a.is_mtsdf());
-
+    fn bitmap_keys_are_size_specific() {
         let s10 = GlyphKey::bitmap(fid(0), GlyphId(5), 0, 10);
         let s11 = GlyphKey::bitmap(fid(0), GlyphId(5), 0, 11);
         assert_ne!(s10, s11, "bitmaps are size-specific");
-        assert!(!s10.is_mtsdf());
     }
 
     #[test]
     fn variation_hash_separates_variable_font_instances() {
-        let light = GlyphKey::mtsdf(fid(0), GlyphId(5), 0xAAAA);
-        let bold = GlyphKey::mtsdf(fid(0), GlyphId(5), 0xBBBB);
+        let light = GlyphKey::bitmap(fid(0), GlyphId(5), 0xAAAA, 12);
+        let bold = GlyphKey::bitmap(fid(0), GlyphId(5), 0xBBBB, 12);
         assert_ne!(light, bold);
     }
 
     #[test]
     fn zero_bitmap_size_is_clamped_away() {
-        // A zero size would silently alias a bitmap key onto an MTSDF key.
+        // A zero-pixel raster is meaningless; the smallest real size is one.
         assert_eq!(GlyphKey::bitmap(fid(0), GlyphId(1), 0, 0).bitmap_size, 1);
     }
 
@@ -639,9 +601,6 @@ mod tests {
         assert_ne!(gray0, gray1, "quarter-pixel positions need separate bitmaps");
         assert_ne!(gray1, rgb1, "grayscale and RGB coverage must not alias");
         assert_eq!(GlyphKey::subpixel_bitmap(fid(0), GlyphId(5), 0, 12, 9).subpixel_phase, 3);
-        assert_eq!(GlyphKey::mtsdf(fid(0), GlyphId(5), 0).subpixel_phase, 0);
-        assert!(GlyphKey::mtsdf(fid(0), GlyphId(5), 0).is_mtsdf());
-        assert!(!rgb1.is_mtsdf());
     }
 
     #[test]
@@ -662,7 +621,7 @@ mod tests {
 
     #[test]
     fn glyph_format_pixel_sizes() {
-        assert_eq!(GlyphFormat::Mtsdf.bytes_per_pixel(), 4);
+        assert_eq!(GlyphFormat::ColorBitmap.bytes_per_pixel(), 4);
         assert_eq!(GlyphFormat::Grayscale.bytes_per_pixel(), 1);
         assert_eq!(GlyphFormat::Subpixel.bytes_per_pixel(), 3);
     }

@@ -90,12 +90,8 @@ jobs:
       # not link-time requirements — but a runner without them turns a windowing
       # bug into a confusing runtime failure, and they cost seconds.
       #
-      # `mesa-vulkan-drivers` is the one that earns its place: it provides
-      # lavapipe, a software Vulkan device, which is what lets the headless
-      # suite in `spherekit-wgpu/tests/pipelines.rs` actually build every
-      # pipeline and compile every WGSL module through naga on a real adapter.
-      # Without it that suite skips itself and the shaders are only checked by
-      # the device-free unit tests.
+      # fontconfig and freetype are link-time requirements: the prebuilt Skia
+      # that `skia-safe` downloads for Linux is built against the system copies.
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: |
@@ -104,7 +100,7 @@ jobs:
             pkg-config \
             libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
             libxkbcommon-dev libwayland-dev \
-            mesa-vulkan-drivers
+            libfontconfig1-dev libfreetype6-dev
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -137,10 +133,12 @@ jobs:
           cargo test --workspace --all-targets --locked
           cargo test --workspace --doc --locked
 
-      # Re-run with output so the adapter each platform actually found is in the
-      # log. Everything is compiled by now, so this costs a second.
-      - name: Report the GPU adapter
-        run: cargo test -p spherekit-wgpu --test pipelines --locked -- --nocapture
+      # Re-run the renderer suites with output so the device each platform
+      # actually rendered on is in the log. Windows runners have no GPU, so the
+      # Direct3D 11 suite runs on WARP there; Skia runs everywhere. Everything
+      # is compiled by now, so this costs seconds.
+      - name: Report the renderers
+        run: cargo test -p spherekit-d3d11 -p spherekit-skia --locked -- --nocapture
 
       # The plug-in configuration: no window runner, no clipboard, host-owned
       # window only. It is the one arrangement where `backend::nc` compiles with

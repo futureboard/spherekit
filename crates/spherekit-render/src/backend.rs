@@ -1,9 +1,15 @@
 //! The renderer backend seam.
 //!
 //! Everything above this line — canvas, scene, batching, layout, widgets —
-//! is backend-agnostic. `spherekit-wgpu` is the only implementation today, but the
-//! seam exists so a native D3D12, Metal or software backend can be added
-//! without redesigning anything above it.
+//! is backend-agnostic. Two implementations exist:
+//!
+//! | Crate | Rasterises on | Presents through |
+//! |-------|---------------|------------------|
+//! | `spherekit-d3d11` | GPU, Direct3D 11 (Windows) | DXGI flip-model swap chain on DirectComposition |
+//! | `spherekit-skia`  | CPU, Skia raster | the platform's software blit (GDI, X11/Wayland, CoreGraphics) |
+//!
+//! The Skia backend is the fallback: it runs wherever there is no usable
+//! Direct3D 11 device, and is the only backend off Windows.
 //!
 //! The trait is deliberately coarse. Dispatch happens once per frame and once
 //! per pass, never per primitive, so `dyn` here costs nothing measurable while
@@ -228,6 +234,24 @@ pub trait RendererBackend {
 
     /// Releases a texture.
     fn destroy_texture(&mut self, id: TextureId);
+
+    /// Declares which texture holds glyph atlas page `page`.
+    ///
+    /// [`crate::BatchKind::Glyph`] names an atlas *page*, not a texture,
+    /// because the batch compiler runs before the text system's pages have
+    /// been uploaded. The owner of the atlas uploads each page with
+    /// [`RendererBackend::upload_texture`] and then binds it here. A glyph batch
+    /// whose page has no texture is skipped, not an error.
+    fn set_atlas_page(&mut self, page: u32, texture: TextureId);
+
+    /// The most recently rendered frame as tightly packed RGBA8 rows,
+    /// sRGB-encoded and premultiplied.
+    ///
+    /// For screenshots and pixel tests. An offscreen renderer can answer at any
+    /// time; a windowed one only between [`RendererBackend::render`] and
+    /// [`RendererBackend::end_frame`], because a presented back buffer's
+    /// contents are undefined. Anything else is an error, not a panic.
+    fn read_pixels(&mut self) -> Result<Vec<u8>, RenderError>;
 
     /// Bytes of GPU memory currently held by textures and buffers.
     fn memory_usage(&self) -> u64;
